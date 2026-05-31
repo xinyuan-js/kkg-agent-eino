@@ -1,0 +1,73 @@
+package config
+
+import (
+	"os"
+	"strconv"
+	"strings"
+)
+
+type Config struct {
+	Env            string
+	Port           string
+	AllowedOrigins []string
+	JWTSecret      string
+	KKGBlogBaseURL string
+	KKGOJBaseURL   string
+	PostgresDSN    string
+	RedisAddr      string
+	MinIOEndpoint  string
+}
+
+func Load() Config {
+	return Config{
+		Env:            getEnv("APP_ENV", "dev"),
+		Port:           getEnv("AGENT_API_PORT", "8088"),
+		AllowedOrigins: splitCSV(getEnv("AGENT_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")),
+		JWTSecret:      getEnv("AGENT_JWT_SECRET", "change-me"),
+		KKGBlogBaseURL: trimRightSlash(getEnv("KKG_BLOG_BASE_URL", "http://127.0.0.1/blog-api")),
+		KKGOJBaseURL:   trimRightSlash(getEnv("KKG_OJ_BASE_URL", "http://127.0.0.1/oj-api")),
+		PostgresDSN:    getEnv("POSTGRES_DSN", "postgres://kkg_agent:kkg_agent@127.0.0.1:5432/kkg_agent?sslmode=disable"),
+		RedisAddr:      getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		MinIOEndpoint:  getEnv("MINIO_ENDPOINT", "127.0.0.1:9000"),
+	}
+}
+
+func (c Config) IsDev() bool {
+	return c.Env == "dev" || c.Env == "local"
+}
+
+func getEnv(key, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func trimRightSlash(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
+}
+
+func IntEnv(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}

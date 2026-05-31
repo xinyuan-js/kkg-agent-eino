@@ -1,0 +1,33 @@
+{
+  "name": "kkg-agent-eino",
+  "dockerComposeFile": "../docker-compose.dev.yml",
+  "service": "workspace",
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
+  "forwardPorts": [3000, 8088, 5432, 6379, 9000, 9001],
+  "portsAttributes": {
+    "3000": {
+      "label": "Nuxt Web"
+    },
+    "8088": {
+      "label": "Agent API"
+    },
+    "9001": {
+      "label": "MinIO Console"
+    }
+  },
+  "postCreateCommand": "cp -n .env.example .env || true && go work sync && cd apps/api && go mod download && cd ../web && npm install",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.Go",
+        "Vue.volar",
+        "bradlc.vscode-tailwindcss"
+      ]
+    }
+  }
+}

@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.local
+
+node_modules/
+.nuxt/
+.output/
+dist/
+
+bin/
+coverage.out
+
+tmp/
+*.log
