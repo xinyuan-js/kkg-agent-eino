@@ -47,5 +47,6 @@ curl -sS -X POST http://localhost:8088/api/v1/agent/run \
 更多细节见：
 
 - [架构说明](docs/architecture.md)
+- [Eino 业务流程约束](docs/eino-workflow.md)
 - [KKG 鉴权与 API 契约](docs/kkg-api-auth.md)
 - [RAG 向量库流程](docs/rag-pipeline.md)

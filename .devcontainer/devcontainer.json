@@ -8,7 +8,7 @@
       "version": "22"
     }
   },
-  "forwardPorts": [3000, 8088, 5432, 6379, 9000, 9001],
+  "forwardPorts": [3000, 8088, 5432, 6379, 19000, 19001],
   "portsAttributes": {
     "3000": {
       "label": "Nuxt Web"
@@ -16,11 +16,11 @@
     "8088": {
       "label": "Agent API"
     },
-    "9001": {
+    "19001": {
       "label": "MinIO Console"
     }
   },
-  "postCreateCommand": "cp -n .env.example .env || true && go work sync && cd apps/api && go mod download && cd ../web && npm install",
+  "postCreateCommand": "cp -n .env.example .env || true && go work sync",
   "customizations": {
     "vscode": {
       "extensions": [

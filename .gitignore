@@ -1,6 +1,11 @@
 .DS_Store
 .env
 .env.local
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
 
 node_modules/
 .nuxt/
@@ -12,3 +17,5 @@ coverage.out
 
 tmp/
 *.log
+
+.cache

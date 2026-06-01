@@ -13,8 +13,50 @@ services:
       - postgres
       - redis
       - minio
+      - api
+      - web
     extra_hosts:
       - host.docker.internal:host-gateway
+
+  api:
+    image: mcr.microsoft.com/devcontainers/go:1-1.24-bookworm
+    working_dir: /workspace/apps/api
+    command: sh -lc "go mod download && go run ./cmd/agent-api"
+    env_file:
+      - .env
+    environment:
+      AGENT_API_PORT: "8088"
+      POSTGRES_DSN: postgres://kkg_agent:kkg_agent@postgres:5432/kkg_agent?sslmode=disable
+      REDIS_ADDR: redis:6379
+      MINIO_ENDPOINT: minio:9000
+    volumes:
+      - .:/workspace:cached
+      - go-cache:/go
+    ports:
+      - "8088:8088"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  web:
+    image: node:22-bookworm
+    working_dir: /workspace/apps/web
+    command: sh -lc "npm install && npm run dev"
+    env_file:
+      - .env
+    environment:
+      NUXT_PUBLIC_AGENT_API_BASE: /agent-api
+      NUXT_AGENT_API_TARGET: http://api:8088
+    volumes:
+      - .:/workspace:cached
+      - node-cache:/workspace/apps/web/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
 
   postgres:
     image: pgvector/pgvector:pg16
@@ -40,8 +82,8 @@ services:
       MINIO_ROOT_USER: kkg_agent
       MINIO_ROOT_PASSWORD: kkg_agent_secret
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "19000:9000"
+      - "19001:9001"
     volumes:
       - minio-data:/data
 

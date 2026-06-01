@@ -36,8 +36,8 @@ internal/response    统一响应 envelope
 
 当前已实现两条可运行编排：
 
-- `chain`: `normalize -> rag_retrieve -> kkg_tools -> synthesize`
-- `graph`: `START -> normalize -> rag_retrieve -> kkg_tools -> synthesize -> END`
+- `chain`: `normalize -> rag_retrieve -> plan_tools -> execute_tools -> synthesize`
+- `graph`: `START -> normalize -> rag_retrieve -> plan_tools -> execute_tools -> synthesize -> END`
 
 `chain` 用于确定性线性流程，适合固定题解生成、固定摘要生成等任务。`graph` 用于后续扩展条件分支，例如：
 
@@ -46,12 +46,19 @@ internal/response    统一响应 envelope
 - 判断用户角色是否为 admin，再决定是否调用管理型工具。
 - 在失败节点上接入重试、降级和人工确认。
 
+KKG 工具严格按 Eino Tool 流程处理：`internal/kkgtools` 使用 `utils.InferTool` 生成 `tool.BaseTool`，`plan_tools` 生成 `schema.ToolCall`，`execute_tools` 统一交给 `compose.ToolsNode` 执行。当前尚未接入真实 ChatModel，所以 `plan_tools` 是确定性规划节点；接入模型后该节点会替换为模型/ReAct 决策节点。
+
 ## API
 
 Agent API 当前暴露：
 
 - `GET /health`
 - `POST /api/v1/agent/run`
+- `GET /api/v1/tools`
+- `POST /api/v1/auth/login`
+- `GET /api/v1/auth/me`
+- `POST /api/v1/auth/refresh`
+- `POST /api/v1/auth/logout`
 
 请求：
 
@@ -90,8 +97,8 @@ Agent API 当前暴露：
 KKG 主项目服务不放进本 compose。通过 `.env` 指向外部服务：
 
 ```env
-KKG_BLOG_BASE_URL=http://host.docker.internal/blog-api
-KKG_OJ_BASE_URL=http://host.docker.internal/oj-api
+KKG_BLOG_BASE_URL=http://host.docker.internal:8080
+KKG_OJ_BASE_URL=http://host.docker.internal:8121
 ```
 
 ## 后续实现顺序
@@ -101,3 +108,5 @@ KKG_OJ_BASE_URL=http://host.docker.internal/oj-api
 3. 接入真实 ChatModel，并将 prompt 模板移入可测试组件。
 4. 将 KKG OJ、博客、文件上传、题解任务接口逐步包装为 Eino tools。
 5. 为 graph 增加条件边、失败降级和工具权限策略。
+
+更多 Eino 边界见 [Eino 业务流程约束](eino-workflow.md)。

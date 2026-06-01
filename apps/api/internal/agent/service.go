@@ -2,13 +2,21 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/adk"
+	einomodel "github.com/cloudwego/eino/components/model"
+	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/schema"
 
 	"kkg-agent-eino/apps/api/internal/kkg"
+	"kkg-agent-eino/apps/api/internal/kkgtools"
+	"kkg-agent-eino/apps/api/internal/memory"
 	"kkg-agent-eino/apps/api/internal/rag"
 )
 
@@ -19,21 +27,61 @@ const (
 	ModeGraph Mode = "graph"
 )
 
+const (
+	routerAgentName   = "kkg_router_agent"
+	platformAgentName = "kkg_platform_agent"
+	blogAgentName     = "kkg_blog_agent"
+	questionAgentName = "kkg_question_agent"
+)
+
 type RunRequest struct {
 	Query       string `json:"query"`
 	Mode        Mode   `json:"mode"`
 	QuestionID  int64  `json:"question_id,omitempty"`
+	SessionID   string `json:"session_id,omitempty"`
+	Language    string `json:"language,omitempty"`
+	Code        string `json:"code,omitempty"`
+	Input       string `json:"input,omitempty"`
+	Submit      bool   `json:"submit,omitempty"`
+	UserID      int64  `json:"-"`
 	AccessToken string `json:"-"`
 	RequestID   string `json:"request_id,omitempty"`
 }
 
 type RunResponse struct {
-	Mode      Mode           `json:"mode"`
-	Answer    string         `json:"answer"`
-	RAGDocs   []rag.Document `json:"rag_docs"`
-	ToolTrace []ToolTrace    `json:"tool_trace"`
-	LatencyMS int64          `json:"latency_ms"`
-	RequestID string         `json:"request_id,omitempty"`
+	Mode        Mode           `json:"mode"`
+	SessionID   string         `json:"session_id,omitempty"`
+	Answer      string         `json:"answer"`
+	RAGDocs     []rag.Document `json:"rag_docs"`
+	ToolTrace   []ToolTrace    `json:"tool_trace"`
+	ToolResults []ToolResult   `json:"tool_results,omitempty"`
+	LatencyMS   int64          `json:"latency_ms"`
+	RequestID   string         `json:"request_id,omitempty"`
+}
+
+type StreamEvent struct {
+	Type      string         `json:"type"`
+	SessionID string         `json:"session_id,omitempty"`
+	Message   string         `json:"message,omitempty"`
+	Trace     *ToolTrace     `json:"trace,omitempty"`
+	Result    *ToolResult    `json:"result,omitempty"`
+	RAGDocs   []rag.Document `json:"rag_docs,omitempty"`
+	Done      *RunResponse   `json:"done,omitempty"`
+}
+
+type ConversationMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ConversationSession struct {
+	ID           string                `json:"id"`
+	Title        string                `json:"title"`
+	LastMessage  string                `json:"last_message,omitempty"`
+	MessageCount int                   `json:"message_count"`
+	LastActiveAt string                `json:"last_active_at,omitempty"`
+	Archived     bool                  `json:"archived"`
+	Messages     []ConversationMessage `json:"messages,omitempty"`
 }
 
 type ToolTrace struct {
@@ -42,25 +90,130 @@ type ToolTrace struct {
 	Message string `json:"message,omitempty"`
 }
 
+type ToolResult struct {
+	Name    string                `json:"name"`
+	Status  string                `json:"status"`
+	Summary string                `json:"summary,omitempty"`
+	Data    any                   `json:"data,omitempty"`
+	Error   *kkgtools.ResultError `json:"error,omitempty"`
+}
+
 type Service struct {
 	retriever rag.Retriever
-	kkg       *kkg.Client
+	chatModel einomodel.BaseChatModel
+	tools     []einotool.BaseTool
+	runner    *adk.Runner
+	memory    memory.Store
 	chain     compose.Runnable[RunRequest, RunResponse]
 	graph     compose.Runnable[RunRequest, RunResponse]
 }
 
 type workState struct {
-	Request    RunRequest
-	Query      string
-	RAGDocs    []rag.Document
-	Question   *kkg.Question
-	ToolTrace  []ToolTrace
-	StartedAt  time.Time
-	Normalized bool
+	Request      RunRequest
+	Query        string
+	SessionID    string
+	RAGDocs      []rag.Document
+	History      []*schema.Message
+	Messages     []*schema.Message
+	TurnMessages []*schema.Message
+	FinalAnswer  string
+	ToolTrace    []ToolTrace
+	ToolResults  []ToolResult
+	StartedAt    time.Time
+	Normalized   bool
 }
 
-func NewService(retriever rag.Retriever, kkgClient *kkg.Client) (*Service, error) {
-	s := &Service{retriever: retriever, kkg: kkgClient}
+func NewService(retriever rag.Retriever, kkgClient *kkg.Client, chatModel einomodel.BaseChatModel, memoryStore memory.Store) (*Service, error) {
+	if chatModel == nil {
+		return nil, fmt.Errorf("eino adk chat model is required")
+	}
+	if retriever == nil {
+		return nil, fmt.Errorf("rag retriever is required")
+	}
+	if kkgClient == nil {
+		return nil, fmt.Errorf("kkg client is required")
+	}
+	if memoryStore == nil {
+		memoryStore = memory.NewInMemoryStore()
+	}
+	tools, err := kkgtools.New(kkgClient)
+	if err != nil {
+		return nil, err
+	}
+	blogTools, questionOnlyTools, err := splitToolsByIntent(context.Background(), tools)
+	if err != nil {
+		return nil, err
+	}
+	questionAgent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+		Name:        questionAgentName,
+		Description: "Use this agent only for KKG OJ question explanation, solution ideas, related blogs, code run, or code submit requests.",
+		Instruction: questionAgentInstruction(),
+		Model:       chatModel,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools:               append(questionOnlyTools, blogTools...),
+				ExecuteSequentially: true,
+			},
+		},
+		MaxIterations: 8,
+	})
+	if err != nil {
+		return nil, err
+	}
+	platformAgent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+		Name:          platformAgentName,
+		Description:   "Assistant for KKG platform capability, API, login, deployment, and project structure questions.",
+		Instruction:   platformAgentInstruction(),
+		Model:         chatModel,
+		MaxIterations: 4,
+	})
+	if err != nil {
+		return nil, err
+	}
+	blogAgent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+		Name:        blogAgentName,
+		Description: "Assistant for KKG blog article discovery, explanation, and related knowledge lookup.",
+		Instruction: blogAgentInstruction(),
+		Model:       chatModel,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools:               blogTools,
+				ExecuteSequentially: true,
+			},
+		},
+		MaxIterations: 6,
+	})
+	if err != nil {
+		return nil, err
+	}
+	platformTool := adk.NewAgentTool(context.Background(), platformAgent, adk.WithAgentInputSchema(platformAgentInputSchema()))
+	blogTool := adk.NewAgentTool(context.Background(), blogAgent, adk.WithAgentInputSchema(blogAgentInputSchema()))
+	questionTool := adk.NewAgentTool(context.Background(), questionAgent, adk.WithAgentInputSchema(questionAgentInputSchema()))
+	routerAgent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+		Name:        routerAgentName,
+		Description: "Top-level router agent for KKG Agent. It decides whether to answer directly or delegate to specialized sub-agents.",
+		Instruction: routerAgentInstruction(),
+		Model:       chatModel,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools:               []einotool.BaseTool{platformTool, blogTool, questionTool},
+				ExecuteSequentially: true,
+			},
+			EmitInternalEvents: true,
+		},
+		MaxIterations: 8,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Service{
+		retriever: retriever,
+		chatModel: chatModel,
+		tools:     tools,
+		runner:    adk.NewRunner(context.Background(), adk.RunnerConfig{Agent: routerAgent, EnableStreaming: true, CheckPointStore: memoryStore}),
+		memory:    memoryStore,
+	}
 
 	chain, err := s.compileChain(context.Background())
 	if err != nil {
@@ -75,26 +228,56 @@ func NewService(retriever rag.Retriever, kkgClient *kkg.Client) (*Service, error
 	return s, nil
 }
 
+func (s *Service) ToolInfos(ctx context.Context) ([]*schema.ToolInfo, error) {
+	infos := make([]*schema.ToolInfo, 0, len(s.tools))
+	for _, t := range s.tools {
+		info, err := t.Info(ctx)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, info)
+	}
+	return infos, nil
+}
+
 func (s *Service) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
+	return s.run(ctx, req, nil)
+}
+
+func (s *Service) Stream(ctx context.Context, req RunRequest, emit func(StreamEvent) error) (RunResponse, error) {
+	return s.run(ctx, req, emit)
+}
+
+func (s *Service) run(ctx context.Context, req RunRequest, emit func(StreamEvent) error) (RunResponse, error) {
 	if req.Mode == "" {
 		req.Mode = ModeGraph
 	}
 	switch req.Mode {
 	case ModeChain:
-		return s.chain.Invoke(ctx, req)
+		return s.invokeWithEmitter(ctx, s.chain, req, emit)
 	case ModeGraph:
-		return s.graph.Invoke(ctx, req)
+		return s.invokeWithEmitter(ctx, s.graph, req, emit)
 	default:
 		return RunResponse{}, fmt.Errorf("unsupported mode %q", req.Mode)
 	}
+}
+
+func (s *Service) invokeWithEmitter(ctx context.Context, runnable compose.Runnable[RunRequest, RunResponse], req RunRequest, emit func(StreamEvent) error) (RunResponse, error) {
+	if emit == nil {
+		return runnable.Invoke(ctx, req)
+	}
+	ctx = context.WithValue(ctx, streamEmitterKey{}, emit)
+	return runnable.Invoke(ctx, req)
 }
 
 func (s *Service) compileChain(ctx context.Context) (compose.Runnable[RunRequest, RunResponse], error) {
 	c := compose.NewChain[RunRequest, RunResponse]()
 	c.AppendLambda(compose.InvokableLambda(s.normalize), compose.WithNodeName("normalize"))
 	c.AppendLambda(compose.InvokableLambda(s.retrieve), compose.WithNodeName("rag_retrieve"))
-	c.AppendLambda(compose.InvokableLambda(s.callKKGTools), compose.WithNodeName("kkg_tools"))
-	c.AppendLambda(compose.InvokableLambda(s.synthesize), compose.WithNodeName("synthesize"))
+	c.AppendLambda(compose.InvokableLambda(s.prepareSession), compose.WithNodeName("prepare_session"))
+	c.AppendLambda(compose.InvokableLambda(s.executeRouterAgent), compose.WithNodeName("adk_chat_model_agent"))
+	c.AppendLambda(compose.InvokableLambda(s.persistSession), compose.WithNodeName("persist_session"))
+	c.AppendLambda(compose.InvokableLambda(s.buildResponse), compose.WithNodeName("build_response"))
 	return c.Compile(ctx, compose.WithGraphName("kkg_agent_chain"))
 }
 
@@ -106,18 +289,26 @@ func (s *Service) compileGraph(ctx context.Context) (compose.Runnable[RunRequest
 	if err := g.AddLambdaNode("rag_retrieve", compose.InvokableLambda(s.retrieve)); err != nil {
 		return nil, err
 	}
-	if err := g.AddLambdaNode("kkg_tools", compose.InvokableLambda(s.callKKGTools)); err != nil {
+	if err := g.AddLambdaNode("prepare_session", compose.InvokableLambda(s.prepareSession)); err != nil {
 		return nil, err
 	}
-	if err := g.AddLambdaNode("synthesize", compose.InvokableLambda(s.synthesize)); err != nil {
+	if err := g.AddLambdaNode("adk_chat_model_agent", compose.InvokableLambda(s.executeRouterAgent)); err != nil {
+		return nil, err
+	}
+	if err := g.AddLambdaNode("persist_session", compose.InvokableLambda(s.persistSession)); err != nil {
+		return nil, err
+	}
+	if err := g.AddLambdaNode("build_response", compose.InvokableLambda(s.buildResponse)); err != nil {
 		return nil, err
 	}
 	edges := [][2]string{
 		{compose.START, "normalize"},
 		{"normalize", "rag_retrieve"},
-		{"rag_retrieve", "kkg_tools"},
-		{"kkg_tools", "synthesize"},
-		{"synthesize", compose.END},
+		{"rag_retrieve", "prepare_session"},
+		{"prepare_session", "adk_chat_model_agent"},
+		{"adk_chat_model_agent", "persist_session"},
+		{"persist_session", "build_response"},
+		{"build_response", compose.END},
 	}
 	for _, edge := range edges {
 		if err := g.AddEdge(edge[0], edge[1]); err != nil {
@@ -154,47 +345,633 @@ func (s *Service) retrieve(ctx context.Context, state workState) (workState, err
 	}
 	state.RAGDocs = docs
 	state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "rag.retrieve", Status: "ok", Message: fmt.Sprintf("%d documents", len(docs))})
+	emitStreamEvent(ctx, StreamEvent{
+		Type:    "rag",
+		RAGDocs: docs,
+		Trace:   &ToolTrace{Name: "rag.retrieve", Status: "ok", Message: fmt.Sprintf("%d documents", len(docs))},
+	})
 	return state, nil
 }
 
-func (s *Service) callKKGTools(ctx context.Context, state workState) (workState, error) {
-	if state.Request.QuestionID <= 0 {
-		state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "kkg.oj.question.get", Status: "skipped", Message: "question_id is empty"})
-		return state, nil
+func (s *Service) prepareSession(ctx context.Context, state workState) (workState, error) {
+	sessionID := strings.TrimSpace(state.Request.SessionID)
+	if sessionID == "" {
+		sessionID = newSessionID()
 	}
-	question, err := s.kkg.GetQuestion(ctx, kkg.ToolContext{AccessToken: state.Request.AccessToken}, state.Request.QuestionID)
+	state.SessionID = sessionID
+	emitStreamEvent(ctx, StreamEvent{Type: "session", SessionID: sessionID})
+
+	if err := s.memory.EnsureSession(ctx, state.Request.UserID, sessionID); err != nil {
+		return state, err
+	}
+
+	history, err := s.memory.LoadMessages(ctx, state.Request.UserID, sessionID, 20)
 	if err != nil {
-		state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "kkg.oj.question.get", Status: "error", Message: err.Error()})
-		return state, nil
+		return state, err
 	}
-	state.Question = question
-	state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "kkg.oj.question.get", Status: "ok", Message: question.Title})
+	history = sanitizeHistory(history, 12)
+	userPrompt := agentUserPrompt(state)
+	messages := make([]*schema.Message, 0, len(history)+1)
+	messages = append(messages, history...)
+	persistedUserMessage := schema.UserMessage(state.Query)
+	runtimeUserMessage := schema.UserMessage(userPrompt)
+	messages = append(messages, runtimeUserMessage)
+	state.History = history
+	state.Messages = messages
+	state.TurnMessages = []*schema.Message{persistedUserMessage}
 	return state, nil
 }
 
-func (s *Service) synthesize(_ context.Context, state workState) (RunResponse, error) {
-	var b strings.Builder
-	b.WriteString("已完成 KKG Agent 编排演示。\n\n")
-	if state.Question != nil {
-		b.WriteString("题目：")
-		b.WriteString(state.Question.Title)
-		b.WriteString("\n\n")
-	}
-	b.WriteString("问题：")
-	b.WriteString(state.Query)
-	b.WriteString("\n\n")
-	b.WriteString("下一步接入真实模型后，这个节点将把 RAG 文档、KKG 工具结果和提示词模板合成为最终答案。")
+func (s *Service) executeRouterAgent(ctx context.Context, state workState) (workState, error) {
+	iter := s.runner.Run(ctx, state.Messages,
+		adk.WithCheckPointID(state.SessionID),
+		adk.WithSessionValues(map[string]any{
+			kkgtools.SessionKeyAccessToken: state.Request.AccessToken,
+			kkgtools.SessionKeyUserID:      state.Request.UserID,
+			kkgtools.SessionKeyRequestID:   state.Request.RequestID,
+		}),
+	)
 
+	var final *schema.Message
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event == nil {
+			continue
+		}
+		if event.Err != nil {
+			state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "eino.adk.runner", Status: "error", Message: event.Err.Error()})
+			return state, event.Err
+		}
+		if event.Output == nil || event.Output.MessageOutput == nil {
+			continue
+		}
+		isRootEvent := isRouterAgentEvent(event)
+		msg, err := collectADKMessage(ctx, event.Output.MessageOutput, isRootEvent)
+		if err != nil {
+			state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "eino.adk.message", Status: "error", Message: err.Error()})
+			continue
+		}
+		if msg != nil && isRootEvent {
+			state.TurnMessages = append(state.TurnMessages, msg)
+		}
+		s.recordADKMessage(ctx, &state, msg, event.Output.MessageOutput)
+		if isRootEvent && msg != nil && msg.Role == schema.Assistant && strings.TrimSpace(msg.Content) != "" {
+			final = msg
+		}
+	}
+
+	if final == nil || strings.TrimSpace(final.Content) == "" {
+		return state, fmt.Errorf("eino adk agent returned no final answer")
+	}
+	state.FinalAnswer = strings.TrimSpace(final.Content)
+	state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "eino.adk.router_agent", Status: "ok", Message: "ReAct loop completed"})
+	return state, nil
+}
+
+func (s *Service) persistSession(ctx context.Context, state workState) (workState, error) {
+	if err := s.memory.AppendMessages(ctx, state.Request.UserID, state.SessionID, state.TurnMessages...); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+func (s *Service) buildResponse(ctx context.Context, state workState) (RunResponse, error) {
 	mode := state.Request.Mode
 	if mode == "" {
 		mode = ModeGraph
 	}
-	return RunResponse{
-		Mode:      mode,
-		Answer:    b.String(),
-		RAGDocs:   state.RAGDocs,
-		ToolTrace: state.ToolTrace,
-		LatencyMS: time.Since(state.StartedAt).Milliseconds(),
-		RequestID: state.Request.RequestID,
-	}, nil
+	out := RunResponse{
+		Mode:        mode,
+		SessionID:   state.SessionID,
+		Answer:      state.FinalAnswer,
+		RAGDocs:     state.RAGDocs,
+		ToolTrace:   state.ToolTrace,
+		ToolResults: state.ToolResults,
+		LatencyMS:   time.Since(state.StartedAt).Milliseconds(),
+		RequestID:   state.Request.RequestID,
+	}
+	emitStreamEvent(ctx, StreamEvent{Type: "done", SessionID: state.SessionID, Done: &out})
+	return out, nil
+}
+
+func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *schema.Message, variant *adk.MessageVariant) {
+	if msg == nil {
+		return
+	}
+	switch msg.Role {
+	case schema.Assistant:
+		if len(msg.ToolCalls) == 0 {
+			return
+		}
+		names := make([]string, 0, len(msg.ToolCalls))
+		for _, call := range msg.ToolCalls {
+			names = append(names, call.Function.Name)
+		}
+		trace := ToolTrace{Name: "eino.adk.model_tool_calls", Status: "ok", Message: strings.Join(names, ", ")}
+		state.ToolTrace = append(state.ToolTrace, trace)
+		emitStreamEvent(ctx, StreamEvent{Type: "trace", Trace: &trace})
+	case schema.Tool:
+		name := msg.ToolName
+		if name == "" && variant != nil {
+			name = variant.ToolName
+		}
+		if name == "" {
+			name = "unknown_tool"
+		}
+		if isAgentToolName(name) {
+			summary := compactText(extractDisplayContent(msg), 120)
+			if summary == "" {
+				summary = "agent completed"
+			}
+			trace := ToolTrace{Name: name, Status: "ok", Message: summary}
+			result := ToolResult{Name: name, Status: "ok", Summary: summary, Data: extractDisplayContent(msg)}
+			state.ToolTrace = append(state.ToolTrace, trace)
+			state.ToolResults = append(state.ToolResults, result)
+			emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
+			return
+		}
+		payload, err := decodeToolPayload(msg)
+		if err != nil {
+			if isKKGToolName(name) {
+				trace := ToolTrace{Name: name, Status: "error", Message: err.Error()}
+				result := ToolResult{Name: name, Status: "error", Summary: err.Error(), Data: extractDisplayContent(msg)}
+				state.ToolTrace = append(state.ToolTrace, trace)
+				state.ToolResults = append(state.ToolResults, result)
+				emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
+				return
+			}
+			summary := compactText(extractDisplayContent(msg), 120)
+			if summary == "" {
+				summary = err.Error()
+			}
+			trace := ToolTrace{Name: name, Status: "ok", Message: summary}
+			result := ToolResult{Name: name, Status: "ok", Summary: summary, Data: extractDisplayContent(msg)}
+			state.ToolTrace = append(state.ToolTrace, trace)
+			state.ToolResults = append(state.ToolResults, result)
+			emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
+			return
+		}
+		status := "ok"
+		if payload.Error != nil || !payload.OK {
+			status = "error"
+		}
+		summary := strings.TrimSpace(payload.Summary)
+		if summary == "" {
+			summary = "completed"
+		}
+		trace := ToolTrace{Name: name, Status: status, Message: summary}
+		result := ToolResult{
+			Name:    name,
+			Status:  status,
+			Summary: summary,
+			Data:    payload.Data,
+			Error:   payload.Error,
+		}
+		state.ToolTrace = append(state.ToolTrace, trace)
+		state.ToolResults = append(state.ToolResults, result)
+		emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
+	}
+}
+
+func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAssistantChunks bool) (*schema.Message, error) {
+	if variant == nil {
+		return nil, nil
+	}
+	if !variant.IsStreaming {
+		return variant.GetMessage()
+	}
+	if variant.MessageStream == nil {
+		return nil, fmt.Errorf("streaming message output is missing stream")
+	}
+	defer variant.MessageStream.Close()
+
+	var chunks []*schema.Message
+	for {
+		chunk, err := variant.MessageStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if chunk == nil {
+			continue
+		}
+		chunks = append(chunks, chunk)
+		if emitAssistantChunks && variant.Role == schema.Assistant && strings.TrimSpace(chunk.Content) != "" {
+			emitStreamEvent(ctx, StreamEvent{Type: "message", Message: chunk.Content})
+		}
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	return schema.ConcatMessages(chunks)
+}
+
+func isRouterAgentEvent(event *adk.AgentEvent) bool {
+	if event == nil {
+		return false
+	}
+	if event.AgentName == routerAgentName {
+		return true
+	}
+	if len(event.RunPath) != 1 {
+		return false
+	}
+	return event.RunPath[0].String() == routerAgentName
+}
+
+func isAgentToolName(name string) bool {
+	switch name {
+	case platformAgentName, blogAgentName, questionAgentName:
+		return true
+	default:
+		return false
+	}
+}
+
+func isKKGToolName(name string) bool {
+	return strings.HasPrefix(name, "kkg_blog_") || strings.HasPrefix(name, "kkg_oj_")
+}
+
+func (s *Service) ListSessions(ctx context.Context, userID int64, archived bool) ([]ConversationSession, error) {
+	items, err := s.memory.ListSessions(ctx, userID, 50, archived)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ConversationSession, 0, len(items))
+	for _, item := range items {
+		out = append(out, ConversationSession{
+			ID:           item.ID,
+			Title:        item.Title,
+			LastMessage:  item.LastMessage,
+			MessageCount: item.MessageCount,
+			LastActiveAt: item.LastActiveAt,
+			Archived:     item.Archived,
+		})
+	}
+	return out, nil
+}
+
+func (s *Service) LoadSession(ctx context.Context, userID int64, sessionID string) (ConversationSession, error) {
+	history, err := s.memory.LoadSession(ctx, userID, sessionID)
+	if err != nil {
+		return ConversationSession{}, err
+	}
+	summary := memory.SessionSummary{ID: sessionID}
+	for _, archived := range []bool{false, true} {
+		items, err := s.memory.ListSessions(ctx, userID, 200, archived)
+		if err != nil {
+			continue
+		}
+		for _, item := range items {
+			if item.ID == sessionID {
+				summary = item
+				break
+			}
+		}
+		if summary.Title != "" || summary.LastMessage != "" || summary.Archived {
+			break
+		}
+	}
+	session := ConversationSession{
+		ID:           sessionID,
+		Title:        summary.Title,
+		LastMessage:  summary.LastMessage,
+		MessageCount: len(history),
+		LastActiveAt: summary.LastActiveAt,
+		Archived:     summary.Archived,
+		Messages:     make([]ConversationMessage, 0),
+	}
+	for _, msg := range history {
+		if msg == nil {
+			continue
+		}
+		switch msg.Role {
+		case schema.User:
+			session.Messages = append(session.Messages, ConversationMessage{Role: "user", Content: extractDisplayContent(msg)})
+		case schema.Assistant:
+			if strings.TrimSpace(msg.Content) == "" {
+				continue
+			}
+			session.Messages = append(session.Messages, ConversationMessage{Role: "assistant", Content: extractDisplayContent(msg)})
+		}
+	}
+	return session, nil
+}
+
+func (s *Service) ArchiveSession(ctx context.Context, userID int64, sessionID string, archived bool) error {
+	return s.memory.ArchiveSession(ctx, userID, sessionID, archived)
+}
+
+func (s *Service) DeleteSession(ctx context.Context, userID int64, sessionID string) error {
+	return s.memory.DeleteSession(ctx, userID, sessionID)
+}
+
+func decodeToolPayload(msg *schema.Message) (*kkgtools.ResultPayload, error) {
+	raw := strings.TrimSpace(msg.Content)
+	if raw == "" && len(msg.UserInputMultiContent) > 0 {
+		for _, part := range msg.UserInputMultiContent {
+			if part.Type != schema.ChatMessagePartTypeText {
+				continue
+			}
+			if strings.TrimSpace(part.Text) == "" {
+				continue
+			}
+			raw = part.Text
+			break
+		}
+	}
+	if raw == "" {
+		return nil, fmt.Errorf("empty tool result message")
+	}
+
+	var payload kkgtools.ResultPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, fmt.Errorf("decode tool result payload: %w", err)
+	}
+	return &payload, nil
+}
+
+type streamEmitterKey struct{}
+
+func emitStreamEvent(ctx context.Context, event StreamEvent) {
+	if ctx == nil {
+		return
+	}
+	emit, ok := ctx.Value(streamEmitterKey{}).(func(StreamEvent) error)
+	if !ok || emit == nil {
+		return
+	}
+	_ = emit(event)
+}
+
+func extractDisplayContent(msg *schema.Message) string {
+	if msg == nil {
+		return ""
+	}
+	text := strings.TrimSpace(msg.Content)
+	if text == "" && len(msg.UserInputMultiContent) > 0 {
+		for _, part := range msg.UserInputMultiContent {
+			if part.Type == schema.ChatMessagePartTypeText && strings.TrimSpace(part.Text) != "" {
+				text = strings.TrimSpace(part.Text)
+				break
+			}
+		}
+	}
+	if text == "" {
+		return ""
+	}
+	var payload map[string]any
+	if json.Unmarshal([]byte(text), &payload) == nil {
+		if userQuery, ok := payload["user_query"].(string); ok && strings.TrimSpace(userQuery) != "" {
+			return strings.TrimSpace(userQuery)
+		}
+	}
+	return text
+}
+
+func sanitizeHistory(history []*schema.Message, limit int) []*schema.Message {
+	if len(history) == 0 {
+		return nil
+	}
+	start := 0
+	if limit > 0 && len(history) > limit {
+		start = len(history) - limit
+	}
+	window := cloneHistoryMessages(history[start:])
+	for len(window) > 0 {
+		msg := window[0]
+		if msg == nil {
+			window = window[1:]
+			continue
+		}
+		if msg.Role != schema.Tool {
+			break
+		}
+		window = window[1:]
+	}
+
+	out := make([]*schema.Message, 0, len(window))
+	pendingToolCalls := make(map[string]struct{})
+	for _, msg := range window {
+		if msg == nil {
+			continue
+		}
+		switch msg.Role {
+		case schema.Assistant:
+			if len(msg.ToolCalls) > 0 {
+				for _, call := range msg.ToolCalls {
+					if strings.TrimSpace(call.ID) != "" {
+						pendingToolCalls[call.ID] = struct{}{}
+					}
+				}
+			}
+			out = append(out, msg)
+		case schema.Tool:
+			if strings.TrimSpace(msg.ToolCallID) == "" {
+				continue
+			}
+			if _, ok := pendingToolCalls[msg.ToolCallID]; !ok {
+				continue
+			}
+			delete(pendingToolCalls, msg.ToolCallID)
+			out = append(out, msg)
+		default:
+			out = append(out, msg)
+		}
+	}
+	return out
+}
+
+func cloneHistoryMessages(messages []*schema.Message) []*schema.Message {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]*schema.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		raw, err := json.Marshal(msg)
+		if err != nil {
+			continue
+		}
+		var copied schema.Message
+		if err := json.Unmarshal(raw, &copied); err != nil {
+			continue
+		}
+		out = append(out, &copied)
+	}
+	return out
+}
+
+func generalAgentInstruction() string {
+	return strings.Join([]string{
+		"你是 KKG Agent 的通用智能体。",
+		"你处理普通问答、平台说明、工程讨论、系统能力说明和非 OJ 题目请求。",
+		"你没有工具可用，因此只能基于当前消息和已知上下文直接回答。",
+		"回答必须中文、简洁、明确；不知道的内容直接说明，不要虚构题目、博客、提交记录或平台数据。",
+	}, "\n")
+}
+
+func routerAgentInstruction() string {
+	return strings.Join([]string{
+		"你是 KKG Agent 的顶层路由智能体。",
+		"你必须先判断当前请求是否需要委派给专业子智能体；只有在需要专业领域能力时才调用子智能体工具。",
+		"可用子智能体包括：KKG 平台说明、KKG 博客知识、KKG OJ 题目讲解与提交分析。",
+		"调用子智能体工具时，必须严格按工具参数 schema 传参，确保 request 自包含，必要时带上 question_id、code、language、input、submit 等字段。",
+		"如果用户只是普通聊天、一般工程问题、泛化解释，直接回答，不要强行调用子智能体。",
+		"如果用户的问题同时涉及多个子领域，可以按需要顺序调用多个子智能体，再综合回答。",
+		"回答必须中文、简洁、明确；不要编造平台数据、博客内容、题目条件或提交结果。",
+	}, "\n")
+}
+
+func platformAgentInstruction() string {
+	return strings.Join([]string{
+		"你是 KKG 平台与项目说明智能体。",
+		"你的输入来自父智能体调用工具时传入的结构化参数，其中 request 字段是你必须直接处理的自包含请求。",
+		"你负责回答 KKG 平台能力、登录鉴权、接口边界、项目结构、开发容器、部署方式和系统说明相关问题。",
+		"你没有实时工具，不要假装读取了线上状态或不存在的数据。",
+		"回答必须中文、清晰、工程化，优先说明边界、依赖、前提条件和限制。",
+	}, "\n")
+}
+
+func blogAgentInstruction() string {
+	return strings.Join([]string{
+		"你是 KKG 博客与知识材料智能体。",
+		"你的输入来自父智能体调用工具时传入的结构化参数，其中 request 字段是你必须直接处理的自包含请求。",
+		"你负责查找博客文章、相关文章、评论和知识材料摘要。",
+		"优先使用博客工具获取文章、搜索结果和评论，不要编造文章标题、正文或评论。",
+		"回答必须中文 Markdown，简洁说明：相关材料、摘要、可继续阅读的文章或缺失信息。",
+	}, "\n")
+}
+
+func questionAgentInstruction() string {
+	return strings.Join([]string{
+		"你是 KKG OJ 的题目讲解子智能体，只处理题目讲解、题解、相关博客、代码运行和提交验证。",
+		"你的输入来自父智能体调用工具时传入的结构化参数，request 字段描述任务本身；question_id、code、language、input、submit 等字段会按需提供。",
+		"用户询问题目做法时，优先根据题目 ID 调用 KKG OJ 工具获取题面；需要相关资料时调用博客或题解工具。",
+		"不要编造不存在的题目条件、博客、提交结果或工具返回。",
+		"如果用户提供代码并要求运行或提交，只有在已登录且题目 ID 明确时才调用运行或提交工具。",
+		"输出中文 Markdown，结构包含：题目理解、知识点、做法讲解、复杂度、相关博客、下一步建议。",
+	}, "\n")
+}
+
+func agentUserPrompt(state workState) string {
+	payload := map[string]any{
+		"user_query":  state.Query,
+		"question_id": state.Request.QuestionID,
+		"language":    state.Request.Language,
+		"code":        state.Request.Code,
+		"input":       state.Request.Input,
+		"submit":      state.Request.Submit,
+		"rag_docs":    compactRAGDocs(state.RAGDocs),
+	}
+	raw, _ := json.MarshalIndent(payload, "", "  ")
+	return strings.Join([]string{
+		"以下是当前会话请求的结构化上下文。",
+		"请根据当前智能体的职责回答，不要越权假装具备其他能力。",
+		"",
+		"```json",
+		string(raw),
+		"```",
+	}, "\n")
+}
+
+func platformAgentInputSchema() *schema.ParamsOneOf {
+	return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+		"request": {
+			Desc:     "需要 KKG 平台说明子智能体处理的自包含请求，应该包含用户真正关心的平台/接口/登录/容器/部署问题。",
+			Required: true,
+			Type:     schema.String,
+		},
+	})
+}
+
+func blogAgentInputSchema() *schema.ParamsOneOf {
+	return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+		"request": {
+			Desc:     "需要 KKG 博客子智能体处理的自包含请求，应该包含要查找的博客主题、文章方向或评论上下文。",
+			Required: true,
+			Type:     schema.String,
+		},
+	})
+}
+
+func questionAgentInputSchema() *schema.ParamsOneOf {
+	return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+		"request": {
+			Desc:     "需要 KKG OJ 题目子智能体处理的自包含请求，应描述题目讲解、提交结果分析、运行代码或题解查找任务。",
+			Required: true,
+			Type:     schema.String,
+		},
+		"question_id": {
+			Desc: "可选，OJ 题目 ID。",
+			Type: schema.Integer,
+		},
+		"language": {
+			Desc: "可选，代码语言。",
+			Type: schema.String,
+		},
+		"code": {
+			Desc: "可选，待运行或待提交的代码。",
+			Type: schema.String,
+		},
+		"input": {
+			Desc: "可选，运行代码时的标准输入。",
+			Type: schema.String,
+		},
+		"submit": {
+			Desc: "可选，是否偏向正式提交与提交结果分析。",
+			Type: schema.Boolean,
+		},
+	})
+}
+
+func compactRAGDocs(docs []rag.Document) []map[string]any {
+	out := make([]map[string]any, 0, len(docs))
+	for _, doc := range docs {
+		out = append(out, map[string]any{
+			"title":   doc.Title,
+			"source":  doc.Source,
+			"content": compactText(doc.Content, 220),
+			"score":   doc.Score,
+		})
+	}
+	return out
+}
+
+func compactText(value string, limit int) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	if limit <= 0 || len([]rune(value)) <= limit {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:limit]) + "..."
+}
+
+func newSessionID() string {
+	return fmt.Sprintf("sess_%d", time.Now().UnixNano())
+}
+
+func splitToolsByIntent(ctx context.Context, tools []einotool.BaseTool) ([]einotool.BaseTool, []einotool.BaseTool, error) {
+	blogTools := make([]einotool.BaseTool, 0)
+	questionTools := make([]einotool.BaseTool, 0)
+	for _, t := range tools {
+		info, err := t.Info(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch {
+		case strings.HasPrefix(info.Name, "kkg_blog_"):
+			blogTools = append(blogTools, t)
+		case strings.HasPrefix(info.Name, "kkg_oj_"):
+			questionTools = append(questionTools, t)
+		}
+	}
+	return blogTools, questionTools, nil
 }
