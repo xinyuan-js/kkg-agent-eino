@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"time"
 
 	"kkg-agent-eino/apps/api/internal/agent"
 	"kkg-agent-eino/apps/api/internal/config"
@@ -39,7 +40,7 @@ func main() {
 		log.Fatalf("open memory store: %v", err)
 	}
 
-	retriever := buildRetriever(cfg)
+	retriever := buildRetriever(cfg, kkgClient)
 	agentSvc, err := agent.NewService(retriever, kkgClient, chatModel, memoryStore)
 	if err != nil {
 		log.Fatalf("build agent service: %v", err)
@@ -52,10 +53,10 @@ func main() {
 	}
 }
 
-func buildRetriever(cfg config.Config) rag.Retriever {
+func buildRetriever(cfg config.Config, kkgClient *kkg.Client) rag.Retriever {
 	if cfg.DashScopeAPIKey == "" {
 		log.Printf("semantic rag disabled: DASHSCOPE_API_KEY is empty")
-		return rag.StaticRetriever{}
+		return rag.NoopRetriever{}
 	}
 	embedder, err := dashscope.NewEmbedder(dashscope.EmbeddingConfig{
 		BaseURL:    cfg.DashScopeBaseURL,
@@ -65,13 +66,48 @@ func buildRetriever(cfg config.Config) rag.Retriever {
 	})
 	if err != nil {
 		log.Printf("semantic rag disabled: build dashscope embedder: %v", err)
-		return rag.StaticRetriever{}
+		return rag.NoopRetriever{}
 	}
-	retriever, err := rag.NewSemanticRetriever(embedder, rag.NewInMemoryVectorStore())
+	vectorStore, err := rag.OpenPGVectorStore(context.Background(), cfg.PostgresDSN, cfg.DashScopeEmbeddingDim)
+	if err != nil {
+		log.Printf("pgvector store unavailable, falling back to in-memory vector store: %v", err)
+		vectorStore = nil
+	}
+	if vectorStore == nil {
+		retriever, err := rag.NewSemanticRetriever(embedder, rag.NewInMemoryVectorStore())
+		if err != nil {
+			log.Printf("semantic rag disabled: build semantic retriever: %v", err)
+			return rag.NoopRetriever{}
+		}
+		log.Printf("semantic rag enabled: %s dim=%d store=memory", cfg.DashScopeEmbeddingModel, cfg.DashScopeEmbeddingDim)
+		indexQuestions(cfg, kkgClient, retriever)
+		return retriever
+	}
+
+	retriever, err := rag.NewSemanticRetriever(embedder, vectorStore)
 	if err != nil {
 		log.Printf("semantic rag disabled: build semantic retriever: %v", err)
-		return rag.StaticRetriever{}
+		return rag.NoopRetriever{}
 	}
-	log.Printf("semantic rag enabled: %s dim=%d", cfg.DashScopeEmbeddingModel, cfg.DashScopeEmbeddingDim)
+	log.Printf("semantic rag enabled: %s dim=%d store=pgvector", cfg.DashScopeEmbeddingModel, cfg.DashScopeEmbeddingDim)
+	indexQuestions(cfg, kkgClient, retriever)
 	return retriever
+}
+
+func indexQuestions(cfg config.Config, kkgClient *kkg.Client, retriever *rag.SemanticRetriever) {
+	if cfg.RAGQuestionIndexMaxPages <= 0 {
+		log.Printf("question rag index disabled: RAG_QUESTION_INDEX_MAX_PAGES <= 0")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	stats, err := rag.IndexKKGQuestions(ctx, kkgClient, retriever, rag.QuestionIndexConfig{
+		MaxPages: int64(cfg.RAGQuestionIndexMaxPages),
+		PageSize: int64(cfg.RAGQuestionIndexPageSize),
+	})
+	if err != nil {
+		log.Printf("question rag index failed: %v", err)
+		return
+	}
+	log.Printf("question rag index completed: indexed=%d skipped=%d", stats.Indexed, stats.Skipped)
 }

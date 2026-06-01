@@ -160,7 +160,7 @@ func newGetPostCommentsTool(client *kkg.Client) (einotool.BaseTool, error) {
 }
 
 func newListQuestionsTool(client *kkg.Client) (einotool.BaseTool, error) {
-	return utils.InferEnhancedTool("kkg_oj_list_questions", "分页读取 KKG OJ 题目列表。适合用户没有指定题目 ID 时发现候选题目。", func(ctx context.Context, input ListQuestionsInput) (*schema.ToolResult, error) {
+	return utils.InferEnhancedTool("kkg_oj_list_questions", "分页读取 KKG OJ 题目列表。仅在 RAG 无结果或需要查看最新列表时少量使用；题目推荐优先使用 rag_docs，不要循环翻页。", func(ctx context.Context, input ListQuestionsInput) (*schema.ToolResult, error) {
 		return executeTool(ctx, "kkg_oj_list_questions", func(ctx context.Context) (*kkg.PageResult, error) {
 			input.Current = clampInt64Min(input.Current, 1)
 			input.PageSize = clampInt64(input.PageSize, 5, 50)
@@ -172,7 +172,7 @@ func newListQuestionsTool(client *kkg.Client) (einotool.BaseTool, error) {
 }
 
 func newGetQuestionTool(client *kkg.Client) (einotool.BaseTool, error) {
-	return utils.InferEnhancedTool("kkg_oj_get_question", "读取 KKG OJ 题目详情，包括题面、标签、样例和判题配置。", func(ctx context.Context, input GetQuestionInput) (*schema.ToolResult, error) {
+	return utils.InferEnhancedTool("kkg_oj_get_question", "按明确的题目 ID 读取 KKG OJ 题目详情，包括题面、标签、样例和判题配置。不要用于推荐场景批量查询候选题。", func(ctx context.Context, input GetQuestionInput) (*schema.ToolResult, error) {
 		return executeTool(ctx, "kkg_oj_get_question", func(ctx context.Context) (*kkg.Question, error) {
 			if input.ID <= 0 {
 				return nil, fmt.Errorf("question id is required")

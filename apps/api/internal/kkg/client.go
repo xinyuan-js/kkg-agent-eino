@@ -253,7 +253,7 @@ func (c *Client) GetQuestion(ctx context.Context, toolCtx ToolContext, id int64)
 }
 
 func (c *Client) ListQuestions(ctx context.Context, toolCtx ToolContext, req PageRequest) (*PageResult, error) {
-	req = normalizePage(req, 5, 50)
+	req = normalizePage(req, 5, 20)
 	var envelope struct {
 		Code    int        `json:"code"`
 		Message string     `json:"message"`

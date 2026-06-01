@@ -335,9 +335,15 @@ func (s *Service) normalize(_ context.Context, req RunRequest) (workState, error
 }
 
 func (s *Service) retrieve(ctx context.Context, state workState) (workState, error) {
+	if !shouldRetrieveRAG(state) {
+		trace := ToolTrace{Name: "rag.retrieve", Status: "skipped", Message: "not a question recommendation request"}
+		state.ToolTrace = append(state.ToolTrace, trace)
+		emitStreamEvent(ctx, StreamEvent{Type: "trace", Trace: &trace})
+		return state, nil
+	}
 	docs, err := s.retriever.Retrieve(ctx, rag.Query{
 		Text:      state.Query,
-		TopK:      5,
+		TopK:      8,
 		RequestID: state.Request.RequestID,
 	})
 	if err != nil {
@@ -351,6 +357,27 @@ func (s *Service) retrieve(ctx context.Context, state workState) (workState, err
 		Trace:   &ToolTrace{Name: "rag.retrieve", Status: "ok", Message: fmt.Sprintf("%d documents", len(docs))},
 	})
 	return state, nil
+}
+
+func shouldRetrieveRAG(state workState) bool {
+	return isQuestionRecommendationRequest(state)
+}
+
+func isQuestionRecommendationRequest(state workState) bool {
+	query := strings.ToLower(strings.TrimSpace(state.Query))
+	if query == "" {
+		return false
+	}
+	keywords := []string{
+		"推荐", "找题", "题目推荐", "相似题", "类似题", "练习", "刷题", "专项", "入门题", "进阶题",
+		"recommend", "practice", "similar", "related", "problem recommendation",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(query, strings.ToLower(keyword)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) prepareSession(ctx context.Context, state workState) (workState, error) {
@@ -383,6 +410,22 @@ func (s *Service) prepareSession(ctx context.Context, state workState) (workStat
 }
 
 func (s *Service) executeRouterAgent(ctx context.Context, state workState) (workState, error) {
+	if isQuestionRecommendationRequest(state) {
+		answer := buildQuestionRecommendationAnswer(state)
+		state.FinalAnswer = answer
+		msg := schema.AssistantMessage(answer, nil)
+		state.TurnMessages = append(state.TurnMessages, msg)
+		status := "ok"
+		if len(state.RAGDocs) == 0 {
+			status = "no_result"
+		}
+		trace := ToolTrace{Name: "rag.question_recommendation", Status: status, Message: fmt.Sprintf("%d documents", len(state.RAGDocs))}
+		state.ToolTrace = append(state.ToolTrace, trace)
+		emitStreamEvent(ctx, StreamEvent{Type: "message", Message: answer})
+		emitStreamEvent(ctx, StreamEvent{Type: "trace", Trace: &trace})
+		return state, nil
+	}
+
 	iter := s.runner.Run(ctx, state.Messages,
 		adk.WithCheckPointID(state.SessionID),
 		adk.WithSessionValues(map[string]any{
@@ -824,6 +867,8 @@ func routerAgentInstruction() string {
 		"你必须先判断当前请求是否需要委派给专业子智能体；只有在需要专业领域能力时才调用子智能体工具。",
 		"可用子智能体包括：KKG 平台说明、KKG 博客知识、KKG OJ 题目讲解与提交分析。",
 		"调用子智能体工具时，必须严格按工具参数 schema 传参，确保 request 自包含，必要时带上 question_id、code、language、input、submit 等字段。",
+		"如果当前请求是题目推荐、找题、专项练习或相似题，并且结构化上下文里已有 rag_docs，直接基于 rag_docs 给出推荐，不要委派题目子智能体逐个查询题目详情。",
+		"只有用户选定具体题目并要求题解、题面详情、代码运行或提交分析时，才委派 KKG OJ 题目子智能体。",
 		"如果用户只是普通聊天、一般工程问题、泛化解释，直接回答，不要强行调用子智能体。",
 		"如果用户的问题同时涉及多个子领域，可以按需要顺序调用多个子智能体，再综合回答。",
 		"回答必须中文、简洁、明确；不要编造平台数据、博客内容、题目条件或提交结果。",
@@ -854,6 +899,9 @@ func questionAgentInstruction() string {
 	return strings.Join([]string{
 		"你是 KKG OJ 的题目讲解子智能体，只处理题目讲解、题解、相关博客、代码运行和提交验证。",
 		"你的输入来自父智能体调用工具时传入的结构化参数，request 字段描述任务本身；question_id、code、language、input、submit 等字段会按需提供。",
+		"当请求是题目推荐、找题、专项练习或相似题时，优先使用父智能体提供的 rag_docs 作为候选题，不要逐个调用 kkg_oj_get_question 批量拉取详情。",
+		"只有用户明确指定某个 question_id 并要求讲解、题面详情、运行或提交时，才调用 kkg_oj_get_question。",
+		"如果没有 rag_docs 且确实需要浏览题库，kkg_oj_list_questions 最多调用一次用于发现候选题；不要循环翻页或连续查多个题目详情。",
 		"用户询问题目做法时，优先根据题目 ID 调用 KKG OJ 工具获取题面；需要相关资料时调用博客或题解工具。",
 		"不要编造不存在的题目条件、博客、提交结果或工具返回。",
 		"如果用户提供代码并要求运行或提交，只有在已登录且题目 ID 明确时才调用运行或提交工具。",
@@ -863,13 +911,14 @@ func questionAgentInstruction() string {
 
 func agentUserPrompt(state workState) string {
 	payload := map[string]any{
-		"user_query":  state.Query,
-		"question_id": state.Request.QuestionID,
-		"language":    state.Request.Language,
-		"code":        state.Request.Code,
-		"input":       state.Request.Input,
-		"submit":      state.Request.Submit,
-		"rag_docs":    compactRAGDocs(state.RAGDocs),
+		"user_query":                   state.Query,
+		"question_id":                  state.Request.QuestionID,
+		"language":                     state.Request.Language,
+		"code":                         state.Request.Code,
+		"input":                        state.Request.Input,
+		"submit":                       state.Request.Submit,
+		"question_recommendation_mode": isQuestionRecommendationRequest(state),
+		"rag_docs":                     compactRAGDocs(state.RAGDocs),
 	}
 	raw, _ := json.MarshalIndent(payload, "", "  ")
 	return strings.Join([]string{
@@ -936,13 +985,65 @@ func compactRAGDocs(docs []rag.Document) []map[string]any {
 	out := make([]map[string]any, 0, len(docs))
 	for _, doc := range docs {
 		out = append(out, map[string]any{
-			"title":   doc.Title,
-			"source":  doc.Source,
-			"content": compactText(doc.Content, 220),
-			"score":   doc.Score,
+			"id":       doc.ID,
+			"title":    doc.Title,
+			"source":   doc.Source,
+			"content":  compactText(doc.Content, 220),
+			"score":    doc.Score,
+			"metadata": doc.Metadata,
 		})
 	}
 	return out
+}
+
+func buildQuestionRecommendationAnswer(state workState) string {
+	if len(state.RAGDocs) == 0 {
+		return "当前题库 RAG 没有检索到可用候选题，所以我不会继续批量查询题目详情。请先确认题库向量索引已经构建完成，或换一个更具体的题型/知识点再试。"
+	}
+
+	var b strings.Builder
+	b.WriteString("可以。根据当前题库 RAG 检索结果，建议优先练这几题：\n\n")
+	for idx, doc := range state.RAGDocs {
+		if idx >= 5 {
+			break
+		}
+		title := strings.TrimSpace(doc.Title)
+		if title == "" {
+			title = doc.ID
+		}
+		questionID := strings.TrimSpace(doc.Metadata["question_id"])
+		difficulty := strings.TrimSpace(doc.Metadata["difficulty"])
+		tags := strings.TrimSpace(doc.Metadata["tags"])
+		if tags == "" {
+			tags = strings.TrimSpace(doc.Metadata["tag_list"])
+		}
+
+		b.WriteString(fmt.Sprintf("%d. %s", idx+1, title))
+		if questionID != "" {
+			b.WriteString(fmt.Sprintf("（ID: %s）", questionID))
+		}
+		b.WriteString("\n")
+		if difficulty != "" || tags != "" {
+			b.WriteString("   - ")
+			parts := make([]string, 0, 2)
+			if difficulty != "" {
+				parts = append(parts, "难度："+difficulty)
+			}
+			if tags != "" {
+				parts = append(parts, "标签："+tags)
+			}
+			b.WriteString(strings.Join(parts, "；"))
+			b.WriteString("\n")
+		}
+		reason := compactText(doc.Content, 120)
+		if reason != "" {
+			b.WriteString("   - 推荐理由：")
+			b.WriteString(reason)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n如果你选定其中一道题，我可以继续按题目 ID 给出题解思路、复杂度分析或代码实现。")
+	return b.String()
 }
 
 func compactText(value string, limit int) string {

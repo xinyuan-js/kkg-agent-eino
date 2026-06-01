@@ -24,6 +24,9 @@ type Config struct {
 	DashScopeAPIKey         string
 	DashScopeEmbeddingModel string
 	DashScopeEmbeddingDim   int
+
+	RAGQuestionIndexMaxPages int
+	RAGQuestionIndexPageSize int
 }
 
 func Load() Config {
@@ -45,6 +48,9 @@ func Load() Config {
 		DashScopeAPIKey:         getEnv("DASHSCOPE_API_KEY", ""),
 		DashScopeEmbeddingModel: getEnv("DASHSCOPE_EMBEDDING_MODEL", "text-embedding-v4"),
 		DashScopeEmbeddingDim:   IntEnv("DASHSCOPE_EMBEDDING_DIM", 1024),
+
+		RAGQuestionIndexMaxPages: IntEnv("RAG_QUESTION_INDEX_MAX_PAGES", 3),
+		RAGQuestionIndexPageSize: IntEnv("RAG_QUESTION_INDEX_PAGE_SIZE", 50),
 	}
 }
 
