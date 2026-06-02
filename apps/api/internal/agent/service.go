@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/adk"
 	einomodel "github.com/cloudwego/eino/components/model"
 	einotool "github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
@@ -98,6 +99,11 @@ type ToolResult struct {
 	Error   *kkgtools.ResultError `json:"error,omitempty"`
 }
 
+type RAGSearchInput struct {
+	Query string `json:"query" jsonschema:"required" jsonschema_description:"检索题库知识、相似题或练习题的查询文本"`
+	TopK  int    `json:"top_k,omitempty" jsonschema_description:"最大返回数量，默认 8，最大 12"`
+}
+
 type Service struct {
 	retriever rag.Retriever
 	chatModel einomodel.BaseChatModel
@@ -137,6 +143,10 @@ func NewService(retriever rag.Retriever, kkgClient *kkg.Client, chatModel einomo
 		memoryStore = memory.NewInMemoryStore()
 	}
 	tools, err := kkgtools.New(kkgClient)
+	if err != nil {
+		return nil, err
+	}
+	ragTool, err := newRAGSearchTool(retriever)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +206,7 @@ func NewService(retriever rag.Retriever, kkgClient *kkg.Client, chatModel einomo
 		Model:       chatModel,
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
-				Tools:               []einotool.BaseTool{platformTool, blogTool, questionTool},
+				Tools:               []einotool.BaseTool{ragTool, platformTool, blogTool, questionTool},
 				ExecuteSequentially: true,
 			},
 			EmitInternalEvents: true,
@@ -210,7 +220,7 @@ func NewService(retriever rag.Retriever, kkgClient *kkg.Client, chatModel einomo
 	s := &Service{
 		retriever: retriever,
 		chatModel: chatModel,
-		tools:     tools,
+		tools:     append([]einotool.BaseTool{ragTool}, tools...),
 		runner:    adk.NewRunner(context.Background(), adk.RunnerConfig{Agent: routerAgent, EnableStreaming: true, CheckPointStore: memoryStore}),
 		memory:    memoryStore,
 	}
@@ -238,6 +248,74 @@ func (s *Service) ToolInfos(ctx context.Context) ([]*schema.ToolInfo, error) {
 		infos = append(infos, info)
 	}
 	return infos, nil
+}
+
+func newRAGSearchTool(retriever rag.Retriever) (einotool.BaseTool, error) {
+	if retriever == nil {
+		return nil, fmt.Errorf("rag retriever is required")
+	}
+	return utils.InferEnhancedTool("kkg_rag_search_questions", "检索 KKG 题库向量索引。适合题目推荐、相似题、专项练习、按知识点找题和需要题库候选材料的请求。", func(ctx context.Context, input RAGSearchInput) (*schema.ToolResult, error) {
+		query := strings.TrimSpace(input.Query)
+		if query == "" {
+			return nil, fmt.Errorf("query is required")
+		}
+		topK := input.TopK
+		if topK <= 0 {
+			topK = 8
+		}
+		if topK > 12 {
+			topK = 12
+		}
+		docs, err := retriever.Retrieve(ctx, rag.Query{
+			Text:      query,
+			TopK:      topK,
+			RequestID: requestIDFromContext(ctx),
+		})
+		if err != nil {
+			return newAgentToolResult(kkgtools.ResultPayload{
+				Tool:    "kkg_rag_search_questions",
+				OK:      false,
+				Summary: "retrieval failed",
+				Error: &kkgtools.ResultError{
+					Type:    "tool_error",
+					Message: err.Error(),
+				},
+			})
+		}
+		return newAgentToolResult(kkgtools.ResultPayload{
+			Tool:    "kkg_rag_search_questions",
+			OK:      true,
+			Summary: fmt.Sprintf("%d documents", len(docs)),
+			Data:    docs,
+		})
+	})
+}
+
+func newAgentToolResult(payload kkgtools.ResultPayload) (*schema.ToolResult, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal tool result payload: %w", err)
+	}
+	return &schema.ToolResult{
+		Parts: []schema.ToolOutputPart{{
+			Type: schema.ToolPartTypeText,
+			Text: string(raw),
+			Extra: map[string]any{
+				"tool":    payload.Tool,
+				"ok":      payload.OK,
+				"summary": payload.Summary,
+			},
+		}},
+	}, nil
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	value, ok := adk.GetSessionValue(ctx, kkgtools.SessionKeyRequestID)
+	if !ok {
+		return ""
+	}
+	requestID, _ := value.(string)
+	return strings.TrimSpace(requestID)
 }
 
 func (s *Service) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
@@ -273,7 +351,6 @@ func (s *Service) invokeWithEmitter(ctx context.Context, runnable compose.Runnab
 func (s *Service) compileChain(ctx context.Context) (compose.Runnable[RunRequest, RunResponse], error) {
 	c := compose.NewChain[RunRequest, RunResponse]()
 	c.AppendLambda(compose.InvokableLambda(s.normalize), compose.WithNodeName("normalize"))
-	c.AppendLambda(compose.InvokableLambda(s.retrieve), compose.WithNodeName("rag_retrieve"))
 	c.AppendLambda(compose.InvokableLambda(s.prepareSession), compose.WithNodeName("prepare_session"))
 	c.AppendLambda(compose.InvokableLambda(s.executeRouterAgent), compose.WithNodeName("adk_chat_model_agent"))
 	c.AppendLambda(compose.InvokableLambda(s.persistSession), compose.WithNodeName("persist_session"))
@@ -284,9 +361,6 @@ func (s *Service) compileChain(ctx context.Context) (compose.Runnable[RunRequest
 func (s *Service) compileGraph(ctx context.Context) (compose.Runnable[RunRequest, RunResponse], error) {
 	g := compose.NewGraph[RunRequest, RunResponse]()
 	if err := g.AddLambdaNode("normalize", compose.InvokableLambda(s.normalize)); err != nil {
-		return nil, err
-	}
-	if err := g.AddLambdaNode("rag_retrieve", compose.InvokableLambda(s.retrieve)); err != nil {
 		return nil, err
 	}
 	if err := g.AddLambdaNode("prepare_session", compose.InvokableLambda(s.prepareSession)); err != nil {
@@ -303,8 +377,7 @@ func (s *Service) compileGraph(ctx context.Context) (compose.Runnable[RunRequest
 	}
 	edges := [][2]string{
 		{compose.START, "normalize"},
-		{"normalize", "rag_retrieve"},
-		{"rag_retrieve", "prepare_session"},
+		{"normalize", "prepare_session"},
 		{"prepare_session", "adk_chat_model_agent"},
 		{"adk_chat_model_agent", "persist_session"},
 		{"persist_session", "build_response"},
@@ -332,52 +405,6 @@ func (s *Service) normalize(_ context.Context, req RunRequest) (workState, error
 		StartedAt:  time.Now(),
 		Normalized: true,
 	}, nil
-}
-
-func (s *Service) retrieve(ctx context.Context, state workState) (workState, error) {
-	if !shouldRetrieveRAG(state) {
-		trace := ToolTrace{Name: "rag.retrieve", Status: "skipped", Message: "not a question recommendation request"}
-		state.ToolTrace = append(state.ToolTrace, trace)
-		emitStreamEvent(ctx, StreamEvent{Type: "trace", Trace: &trace})
-		return state, nil
-	}
-	docs, err := s.retriever.Retrieve(ctx, rag.Query{
-		Text:      state.Query,
-		TopK:      8,
-		RequestID: state.Request.RequestID,
-	})
-	if err != nil {
-		return state, err
-	}
-	state.RAGDocs = docs
-	state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "rag.retrieve", Status: "ok", Message: fmt.Sprintf("%d documents", len(docs))})
-	emitStreamEvent(ctx, StreamEvent{
-		Type:    "rag",
-		RAGDocs: docs,
-		Trace:   &ToolTrace{Name: "rag.retrieve", Status: "ok", Message: fmt.Sprintf("%d documents", len(docs))},
-	})
-	return state, nil
-}
-
-func shouldRetrieveRAG(state workState) bool {
-	return isQuestionRecommendationRequest(state)
-}
-
-func isQuestionRecommendationRequest(state workState) bool {
-	query := strings.ToLower(strings.TrimSpace(state.Query))
-	if query == "" {
-		return false
-	}
-	keywords := []string{
-		"推荐", "找题", "题目推荐", "相似题", "类似题", "练习", "刷题", "专项", "入门题", "进阶题",
-		"recommend", "practice", "similar", "related", "problem recommendation",
-	}
-	for _, keyword := range keywords {
-		if strings.Contains(query, strings.ToLower(keyword)) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Service) prepareSession(ctx context.Context, state workState) (workState, error) {
@@ -410,22 +437,6 @@ func (s *Service) prepareSession(ctx context.Context, state workState) (workStat
 }
 
 func (s *Service) executeRouterAgent(ctx context.Context, state workState) (workState, error) {
-	if isQuestionRecommendationRequest(state) {
-		answer := buildQuestionRecommendationAnswer(state)
-		state.FinalAnswer = answer
-		msg := schema.AssistantMessage(answer, nil)
-		state.TurnMessages = append(state.TurnMessages, msg)
-		status := "ok"
-		if len(state.RAGDocs) == 0 {
-			status = "no_result"
-		}
-		trace := ToolTrace{Name: "rag.question_recommendation", Status: status, Message: fmt.Sprintf("%d documents", len(state.RAGDocs))}
-		state.ToolTrace = append(state.ToolTrace, trace)
-		emitStreamEvent(ctx, StreamEvent{Type: "message", Message: answer})
-		emitStreamEvent(ctx, StreamEvent{Type: "trace", Trace: &trace})
-		return state, nil
-	}
-
 	iter := s.runner.Run(ctx, state.Messages,
 		adk.WithCheckPointID(state.SessionID),
 		adk.WithSessionValues(map[string]any{
@@ -575,6 +586,15 @@ func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *s
 		}
 		state.ToolTrace = append(state.ToolTrace, trace)
 		state.ToolResults = append(state.ToolResults, result)
+		if isRAGToolName(name) && status == "ok" {
+			docs := decodeRAGDocuments(payload.Data)
+			state.RAGDocs = docs
+			emitStreamEvent(ctx, StreamEvent{
+				Type:    "rag",
+				RAGDocs: docs,
+				Trace:   &trace,
+			})
+		}
 		emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
 	}
 }
@@ -638,6 +658,10 @@ func isAgentToolName(name string) bool {
 
 func isKKGToolName(name string) bool {
 	return strings.HasPrefix(name, "kkg_blog_") || strings.HasPrefix(name, "kkg_oj_")
+}
+
+func isRAGToolName(name string) bool {
+	return name == "kkg_rag_search_questions"
 }
 
 func (s *Service) ListSessions(ctx context.Context, userID int64, archived bool) ([]ConversationSession, error) {
@@ -737,6 +761,21 @@ func decodeToolPayload(msg *schema.Message) (*kkgtools.ResultPayload, error) {
 		return nil, fmt.Errorf("decode tool result payload: %w", err)
 	}
 	return &payload, nil
+}
+
+func decodeRAGDocuments(data any) []rag.Document {
+	if data == nil {
+		return nil
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	var docs []rag.Document
+	if err := json.Unmarshal(raw, &docs); err != nil {
+		return nil
+	}
+	return docs
 }
 
 type streamEmitterKey struct{}
@@ -865,10 +904,10 @@ func routerAgentInstruction() string {
 	return strings.Join([]string{
 		"你是 KKG Agent 的顶层路由智能体。",
 		"你必须先判断当前请求是否需要委派给专业子智能体；只有在需要专业领域能力时才调用子智能体工具。",
-		"可用子智能体包括：KKG 平台说明、KKG 博客知识、KKG OJ 题目讲解与提交分析。",
+		"可用能力包括：题库 RAG 检索工具、KKG 平台说明子智能体、KKG 博客知识子智能体、KKG OJ 题目讲解与提交分析子智能体。",
+		"当用户请求题目推荐、找题、专项练习、相似题、按知识点寻找练习材料，或需要题库候选材料时，由你调用 kkg_rag_search_questions；不要依赖业务层预先提供 rag_docs。",
+		"调用 RAG 工具后，直接基于返回的文档给出推荐或候选说明；只有用户选定具体题目并要求题解、题面详情、代码运行或提交分析时，才委派 KKG OJ 题目子智能体。",
 		"调用子智能体工具时，必须严格按工具参数 schema 传参，确保 request 自包含，必要时带上 question_id、code、language、input、submit 等字段。",
-		"如果当前请求是题目推荐、找题、专项练习或相似题，并且结构化上下文里已有 rag_docs，直接基于 rag_docs 给出推荐，不要委派题目子智能体逐个查询题目详情。",
-		"只有用户选定具体题目并要求题解、题面详情、代码运行或提交分析时，才委派 KKG OJ 题目子智能体。",
 		"如果用户只是普通聊天、一般工程问题、泛化解释，直接回答，不要强行调用子智能体。",
 		"如果用户的问题同时涉及多个子领域，可以按需要顺序调用多个子智能体，再综合回答。",
 		"回答必须中文、简洁、明确；不要编造平台数据、博客内容、题目条件或提交结果。",
@@ -899,9 +938,9 @@ func questionAgentInstruction() string {
 	return strings.Join([]string{
 		"你是 KKG OJ 的题目讲解子智能体，只处理题目讲解、题解、相关博客、代码运行和提交验证。",
 		"你的输入来自父智能体调用工具时传入的结构化参数，request 字段描述任务本身；question_id、code、language、input、submit 等字段会按需提供。",
-		"当请求是题目推荐、找题、专项练习或相似题时，优先使用父智能体提供的 rag_docs 作为候选题，不要逐个调用 kkg_oj_get_question 批量拉取详情。",
+		"题目推荐、找题、专项练习或相似题通常应由父智能体先使用 RAG 工具处理；你不要逐个调用 kkg_oj_get_question 批量拉取详情。",
 		"只有用户明确指定某个 question_id 并要求讲解、题面详情、运行或提交时，才调用 kkg_oj_get_question。",
-		"如果没有 rag_docs 且确实需要浏览题库，kkg_oj_list_questions 最多调用一次用于发现候选题；不要循环翻页或连续查多个题目详情。",
+		"如果确实需要浏览题库，kkg_oj_list_questions 最多调用一次用于发现候选题；不要循环翻页或连续查多个题目详情。",
 		"用户询问题目做法时，优先根据题目 ID 调用 KKG OJ 工具获取题面；需要相关资料时调用博客或题解工具。",
 		"不要编造不存在的题目条件、博客、提交结果或工具返回。",
 		"如果用户提供代码并要求运行或提交，只有在已登录且题目 ID 明确时才调用运行或提交工具。",
@@ -911,14 +950,12 @@ func questionAgentInstruction() string {
 
 func agentUserPrompt(state workState) string {
 	payload := map[string]any{
-		"user_query":                   state.Query,
-		"question_id":                  state.Request.QuestionID,
-		"language":                     state.Request.Language,
-		"code":                         state.Request.Code,
-		"input":                        state.Request.Input,
-		"submit":                       state.Request.Submit,
-		"question_recommendation_mode": isQuestionRecommendationRequest(state),
-		"rag_docs":                     compactRAGDocs(state.RAGDocs),
+		"user_query":  state.Query,
+		"question_id": state.Request.QuestionID,
+		"language":    state.Request.Language,
+		"code":        state.Request.Code,
+		"input":       state.Request.Input,
+		"submit":      state.Request.Submit,
 	}
 	raw, _ := json.MarshalIndent(payload, "", "  ")
 	return strings.Join([]string{
@@ -979,71 +1016,6 @@ func questionAgentInputSchema() *schema.ParamsOneOf {
 			Type: schema.Boolean,
 		},
 	})
-}
-
-func compactRAGDocs(docs []rag.Document) []map[string]any {
-	out := make([]map[string]any, 0, len(docs))
-	for _, doc := range docs {
-		out = append(out, map[string]any{
-			"id":       doc.ID,
-			"title":    doc.Title,
-			"source":   doc.Source,
-			"content":  compactText(doc.Content, 220),
-			"score":    doc.Score,
-			"metadata": doc.Metadata,
-		})
-	}
-	return out
-}
-
-func buildQuestionRecommendationAnswer(state workState) string {
-	if len(state.RAGDocs) == 0 {
-		return "当前题库 RAG 没有检索到可用候选题，所以我不会继续批量查询题目详情。请先确认题库向量索引已经构建完成，或换一个更具体的题型/知识点再试。"
-	}
-
-	var b strings.Builder
-	b.WriteString("可以。根据当前题库 RAG 检索结果，建议优先练这几题：\n\n")
-	for idx, doc := range state.RAGDocs {
-		if idx >= 5 {
-			break
-		}
-		title := strings.TrimSpace(doc.Title)
-		if title == "" {
-			title = doc.ID
-		}
-		questionID := strings.TrimSpace(doc.Metadata["question_id"])
-		difficulty := strings.TrimSpace(doc.Metadata["difficulty"])
-		tags := strings.TrimSpace(doc.Metadata["tags"])
-		if tags == "" {
-			tags = strings.TrimSpace(doc.Metadata["tag_list"])
-		}
-
-		b.WriteString(fmt.Sprintf("%d. %s", idx+1, title))
-		if questionID != "" {
-			b.WriteString(fmt.Sprintf("（ID: %s）", questionID))
-		}
-		b.WriteString("\n")
-		if difficulty != "" || tags != "" {
-			b.WriteString("   - ")
-			parts := make([]string, 0, 2)
-			if difficulty != "" {
-				parts = append(parts, "难度："+difficulty)
-			}
-			if tags != "" {
-				parts = append(parts, "标签："+tags)
-			}
-			b.WriteString(strings.Join(parts, "；"))
-			b.WriteString("\n")
-		}
-		reason := compactText(doc.Content, 120)
-		if reason != "" {
-			b.WriteString("   - 推荐理由：")
-			b.WriteString(reason)
-			b.WriteString("\n")
-		}
-	}
-	b.WriteString("\n如果你选定其中一道题，我可以继续按题目 ID 给出题解思路、复杂度分析或代码实现。")
-	return b.String()
 }
 
 func compactText(value string, limit int) string {

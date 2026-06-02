@@ -9,10 +9,10 @@ HTTP Router
   -> agent.Service
     -> Eino Chain / Graph
       -> normalize
-      -> rag_retrieve
       -> prepare_session
       -> router ChatModelAgent
          -> direct answer
+         -> Tool(kkg_rag_search_questions)
          -> AgentTool(platform_agent)
          -> AgentTool(blog_agent)
          -> AgentTool(question_agent)
@@ -32,7 +32,7 @@ HTTP Router
 ## 当前严格边界
 
 - `internal/kkgtools` 只负责定义 Eino Tool 输入结构、描述和 Invokable 函数。
-- `internal/agent` 负责 Chain/Graph 外围编排、RAG 注入、ADK Runner 调用和会话消息管理。
+- `internal/agent` 负责 Chain/Graph 外围编排、RAG Tool 注入、ADK Runner 调用和会话消息管理。
 - `/api/v1/tools` 返回 Eino `schema.ToolInfo`，前端展示的工具 schema 以 Eino 为准。
 - `internal/kkg` 只负责 HTTP、鉴权 token/cookie 透传和 KKG 响应解析，不承载智能体决策。
 
@@ -42,10 +42,10 @@ HTTP Router
 
 ```text
 normalize
-  -> rag_retrieve
   -> prepare_session
   -> router agent
      -> if request is generic: answer directly
+     -> if request needs question recommendation / similar problems / practice candidates: call kkg_rag_search_questions
      -> if request is platform-related: call platform_agent as AgentTool
      -> if request is blog-related: call blog_agent as AgentTool
      -> if request is question-related: call question_agent as AgentTool
@@ -70,7 +70,7 @@ DeepSeek 配置只允许放在本地 `.env` 或部署密钥系统中，不能写
 - 会话消息：按 `schema.Message` 持久化最近若干轮用户/助手消息。
 - Runner checkpoint：作为 Eino ADK `CheckPointStore` 注入 `adk.Runner`。
 
-下一轮请求会先从 `memory.Store` 读取历史消息，再与当前 RAG 注入后的用户消息一起传给 `adk.Runner`。这样多轮上下文与 ADK checkpoint 都由业务层存储承接，而不是散落在 `agent.Service` 的临时内存里。
+下一轮请求会先从 `memory.Store` 读取历史消息，再与当前结构化用户消息一起传给 `adk.Runner`。这样多轮上下文与 ADK checkpoint 都由业务层存储承接，而不是散落在 `agent.Service` 的临时内存里。
 
 运行时的跨 agent / 跨 tool 共享上下文，例如 `access_token`、`user_id`、`request_id`，通过 `adk.WithSessionValues(...)` 注入，并由工具侧使用 `adk.GetSessionValue(...)` 读取。不要再用项目私有的 `context.WithValue` 传递业务关键信息。
 
@@ -93,7 +93,7 @@ ChatModelAgent
   -> final answer
 ```
 
-工具选择必须由 `ChatModelAgent` 的 ReAct loop 产生；业务代码只能提供工具集合、上下文和约束提示，不能预先硬编码“必须调用哪些工具”作为主流程。
+工具选择必须由 `ChatModelAgent` 的 ReAct loop 产生；业务代码只能提供工具集合、上下文和约束提示，不能预先硬编码“必须调用哪些工具”作为主流程。题库 RAG 检索同样作为 `kkg_rag_search_questions` 暴露给顶层 router agent，由 router agent 决定是否调用。
 
 对多智能体协作还必须额外遵守：
 
