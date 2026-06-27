@@ -98,7 +98,7 @@ KKG 主项目服务不放进本 compose。通过 `.env` 指向外部服务：
 
 ```env
 KKG_BLOG_BASE_URL=http://host.docker.internal:8080
-KKG_OJ_BASE_URL=http://host.docker.internal:8121
+KKG_OJ_BASE_URL=http://host.docker.internal:8080/api/v1/oj
 ```
 
 ## 后续实现顺序

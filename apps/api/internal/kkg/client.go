@@ -100,8 +100,8 @@ func (e APIError) Error() string {
 
 func NewClient(blogBaseURL, ojBaseURL string) *Client {
 	return &Client{
-		BlogBaseURL: strings.TrimRight(blogBaseURL, "/"),
-		OJBaseURL:   strings.TrimRight(ojBaseURL, "/"),
+		BlogBaseURL: normalizeBaseURL(blogBaseURL),
+		OJBaseURL:   normalizeOJBaseURL(ojBaseURL),
 		HTTP: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -243,7 +243,7 @@ func (c *Client) GetQuestion(ctx context.Context, toolCtx ToolContext, id int64)
 		Message string   `json:"message"`
 		Data    Question `json:"data"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, c.OJBaseURL+"/api/question/get/vo?"+values.Encode(), toolCtx, nil, &envelope); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.OJBaseURL+"/question/get/vo?"+values.Encode(), toolCtx, nil, &envelope); err != nil {
 		return nil, err
 	}
 	if envelope.Code != 0 {
@@ -259,7 +259,7 @@ func (c *Client) ListQuestions(ctx context.Context, toolCtx ToolContext, req Pag
 		Message string     `json:"message"`
 		Data    PageResult `json:"data"`
 	}
-	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/api/question/list/page/vo", toolCtx, req, &envelope); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/question/list/page/vo", toolCtx, req, &envelope); err != nil {
 		return nil, err
 	}
 	if envelope.Code != 0 {
@@ -274,7 +274,7 @@ func (c *Client) RunCode(ctx context.Context, toolCtx ToolContext, req CodeRunRe
 		Message string `json:"message"`
 		Data    any    `json:"data"`
 	}
-	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/api/question/run", toolCtx, req, &envelope); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/question/run", toolCtx, req, &envelope); err != nil {
 		return nil, err
 	}
 	if envelope.Code != 0 {
@@ -289,7 +289,7 @@ func (c *Client) SubmitSolution(ctx context.Context, toolCtx ToolContext, req Co
 		Message string `json:"message"`
 		Data    any    `json:"data"`
 	}
-	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/api/question/question_submit/do", toolCtx, req, &envelope); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/question/question_submit/do", toolCtx, req, &envelope); err != nil {
 		return nil, err
 	}
 	if envelope.Code != 0 {
@@ -305,7 +305,7 @@ func (c *Client) ListSubmissions(ctx context.Context, toolCtx ToolContext, req S
 		Message string     `json:"message"`
 		Data    PageResult `json:"data"`
 	}
-	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/api/question/question_submit/list/page", toolCtx, req, &envelope); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/question/question_submit/list/page", toolCtx, req, &envelope); err != nil {
 		return nil, err
 	}
 	if envelope.Code != 0 {
@@ -357,13 +357,28 @@ func (c *Client) ListQuestionSolutions(ctx context.Context, toolCtx ToolContext,
 		Message string     `json:"message"`
 		Data    PageResult `json:"data"`
 	}
-	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/api/question/solution/list/page", toolCtx, req, &envelope); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.OJBaseURL+"/question/solution/list/page", toolCtx, req, &envelope); err != nil {
 		return nil, err
 	}
 	if envelope.Code != 0 {
 		return nil, fmt.Errorf("kkg oj list question solutions failed: %s", envelope.Message)
 	}
 	return &envelope.Data, nil
+}
+
+func normalizeBaseURL(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
+}
+
+func normalizeOJBaseURL(value string) string {
+	base := normalizeBaseURL(value)
+	if base == "" {
+		return base
+	}
+	if strings.HasSuffix(base, "/api/v1/oj") {
+		return base
+	}
+	return base + "/api/v1/oj"
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, toolCtx ToolContext, body any, out any) error {

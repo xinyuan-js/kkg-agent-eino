@@ -80,7 +80,7 @@ func buildRetriever(cfg config.Config, kkgClient *kkg.Client) rag.Retriever {
 			return rag.NoopRetriever{}
 		}
 		log.Printf("semantic rag enabled: %s dim=%d store=memory", cfg.DashScopeEmbeddingModel, cfg.DashScopeEmbeddingDim)
-		indexQuestions(cfg, kkgClient, retriever)
+		startQuestionIndex(cfg, kkgClient, retriever)
 		return retriever
 	}
 
@@ -90,8 +90,12 @@ func buildRetriever(cfg config.Config, kkgClient *kkg.Client) rag.Retriever {
 		return rag.NoopRetriever{}
 	}
 	log.Printf("semantic rag enabled: %s dim=%d store=pgvector", cfg.DashScopeEmbeddingModel, cfg.DashScopeEmbeddingDim)
-	indexQuestions(cfg, kkgClient, retriever)
+	startQuestionIndex(cfg, kkgClient, retriever)
 	return retriever
+}
+
+func startQuestionIndex(cfg config.Config, kkgClient *kkg.Client, retriever *rag.SemanticRetriever) {
+	go indexQuestions(cfg, kkgClient, retriever)
 }
 
 func indexQuestions(cfg config.Config, kkgClient *kkg.Client, retriever *rag.SemanticRetriever) {

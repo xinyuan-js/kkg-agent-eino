@@ -1,9 +1,10 @@
 # KKG 鉴权与 API 契约
 
-本文档来自对相邻 KKG 项目的源码阅读：
+本文档来自对相邻 KKG 项目的源码阅读。KKG 已重构为单体后端：
 
-- Blog: `/Users/zhuojianshuo/GolandProjects/awesomeProject/kkg-blog-backend`
-- OJ: `/Users/zhuojianshuo/GolandProjects/awesomeProject/kkg-oj-backend`
+- Backend: `/Users/zhuojianshuo/GolandProjects/awesomeProject/kkg-backend`
+
+Blog 与 OJ 共享同一个 HTTP 服务，默认本地地址为 `http://127.0.0.1:8080`。
 
 ## 统一响应
 
@@ -153,46 +154,48 @@ OJ 支持两套登录态：
 
 ## OJ 可工具化接口
 
+OJ 已统一挂载在 `/api/v1/oj` 前缀下；下面路径均省略此前缀。
+
 用户：
 
-- `POST /api/user/register`
-- `POST /api/user/login`
-- `GET /api/user/login/wx_open`
-- `POST /api/user/logout`
-- `GET /api/user/get/login`
-- `POST /api/user/update/my`
-- `GET /api/user/get/vo`
-- `POST /api/user/list/page/vo`
+- `POST /user/register`
+- `POST /user/login`
+- `GET /user/login/wx_open`
+- `POST /user/logout`
+- `GET /user/get/login`
+- `POST /user/update/my`
+- `GET /user/get/vo`
+- `POST /user/list/page/vo`
 
 题目：
 
-- `POST /api/question/add`
-- `POST /api/question/delete`
-- `POST /api/question/update`
-- `GET /api/question/get`
-- `GET /api/question/get/vo`
-- `POST /api/question/list/page/vo`
-- `POST /api/question/my/list/page/vo`
-- `POST /api/question/list/page`
-- `POST /api/question/edit`
-- `POST /api/question/run`
-- `POST /api/question/question_submit/do`
-- `POST /api/question/question_submit/list/page`
-- `GET /api/question/rank/first-ac-24h`
-- `GET /api/question/submission/events`
+- `POST /question/add`
+- `POST /question/delete`
+- `POST /question/update`
+- `GET /question/get`
+- `GET /question/get/vo`
+- `POST /question/list/page/vo`
+- `POST /question/my/list/page/vo`
+- `POST /question/list/page`
+- `POST /question/edit`
+- `POST /question/run`
+- `POST /question/question_submit/do`
+- `POST /question/question_submit/list/page`
+- `GET /question/rank/first-ac-24h`
+- `GET /question/submission/events`
 
 题解绑定与智能体任务：
 
-- `POST /api/question/solution/bind`
-- `POST /api/question/solution/unbind`
-- `POST /api/question/solution/list/page`
-- `POST /api/question/agent/solution/generate`
-- `GET /api/question/agent/solution/task`
-- `POST /api/question/agent/solution/task/list/page`
+- `POST /question/solution/bind`
+- `POST /question/solution/unbind`
+- `POST /question/solution/list/page`
+- `POST /question/agent/solution/generate`
+- `GET /question/agent/solution/task`
+- `POST /question/agent/solution/task/list/page`
 
 文件：
 
-- `POST /api/file/upload`
+- `POST /file/upload`
 
 ## Agent 工具化优先级
 
@@ -200,9 +203,9 @@ OJ 支持两套登录态：
 
 - Blog search：`GET /api/v1/search`
 - Blog post get：`GET /api/v1/posts/:id`
-- OJ question get VO：`GET /api/question/get/vo`
-- OJ solution list：`POST /api/question/solution/list/page`
-- OJ first AC rank：`GET /api/question/rank/first-ac-24h`
+- OJ question get VO：`GET /question/get/vo`
+- OJ solution list：`POST /question/solution/list/page`
+- OJ first AC rank：`GET /question/rank/first-ac-24h`
 
 第二阶段再开放写操作：
 
