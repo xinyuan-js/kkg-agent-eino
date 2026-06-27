@@ -115,18 +115,19 @@ type Service struct {
 }
 
 type workState struct {
-	Request      RunRequest
-	Query        string
-	SessionID    string
-	RAGDocs      []rag.Document
-	History      []*schema.Message
-	Messages     []*schema.Message
-	TurnMessages []*schema.Message
-	FinalAnswer  string
-	ToolTrace    []ToolTrace
-	ToolResults  []ToolResult
-	StartedAt    time.Time
-	Normalized   bool
+	Request        RunRequest
+	Query          string
+	SessionID      string
+	RAGDocs        []rag.Document
+	History        []*schema.Message
+	Messages       []*schema.Message
+	TurnMessages   []*schema.Message
+	FinalAnswer    string
+	StreamedAnswer bool
+	ToolTrace      []ToolTrace
+	ToolResults    []ToolResult
+	StartedAt      time.Time
+	Normalized     bool
 }
 
 func NewService(retriever rag.Retriever, kkgClient *kkg.Client, chatModel einomodel.BaseChatModel, memoryStore memory.Store) (*Service, error) {
@@ -463,10 +464,13 @@ func (s *Service) executeRouterAgent(ctx context.Context, state workState) (work
 			continue
 		}
 		isRootEvent := isRouterAgentEvent(event)
-		msg, err := collectADKMessage(ctx, event.Output.MessageOutput, isRootEvent)
+		msg, streamed, err := collectADKMessage(ctx, event.Output.MessageOutput, isRootEvent)
 		if err != nil {
 			state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "eino.adk.message", Status: "error", Message: err.Error()})
 			continue
+		}
+		if isRootEvent && streamed {
+			state.StreamedAnswer = true
 		}
 		if msg != nil && isRootEvent {
 			state.TurnMessages = append(state.TurnMessages, msg)
@@ -506,6 +510,9 @@ func (s *Service) buildResponse(ctx context.Context, state workState) (RunRespon
 		ToolResults: state.ToolResults,
 		LatencyMS:   time.Since(state.StartedAt).Milliseconds(),
 		RequestID:   state.Request.RequestID,
+	}
+	if !state.StreamedAnswer {
+		emitAnswerDeltas(ctx, state.FinalAnswer)
 	}
 	emitStreamEvent(ctx, StreamEvent{Type: "done", SessionID: state.SessionID, Done: &out})
 	return out, nil
@@ -599,26 +606,28 @@ func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *s
 	}
 }
 
-func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAssistantChunks bool) (*schema.Message, error) {
+func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAssistantChunks bool) (*schema.Message, bool, error) {
 	if variant == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	if !variant.IsStreaming {
-		return variant.GetMessage()
+		msg, err := variant.GetMessage()
+		return msg, false, err
 	}
 	if variant.MessageStream == nil {
-		return nil, fmt.Errorf("streaming message output is missing stream")
+		return nil, false, fmt.Errorf("streaming message output is missing stream")
 	}
 	defer variant.MessageStream.Close()
 
 	var chunks []*schema.Message
+	streamed := false
 	for {
 		chunk, err := variant.MessageStream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, streamed, err
 		}
 		if chunk == nil {
 			continue
@@ -626,12 +635,14 @@ func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAss
 		chunks = append(chunks, chunk)
 		if emitAssistantChunks && variant.Role == schema.Assistant && strings.TrimSpace(chunk.Content) != "" {
 			emitStreamEvent(ctx, StreamEvent{Type: "message", Message: chunk.Content})
+			streamed = true
 		}
 	}
 	if len(chunks) == 0 {
-		return nil, nil
+		return nil, streamed, nil
 	}
-	return schema.ConcatMessages(chunks)
+	msg, err := schema.ConcatMessages(chunks)
+	return msg, streamed, err
 }
 
 func isRouterAgentEvent(event *adk.AgentEvent) bool {
@@ -789,6 +800,25 @@ func emitStreamEvent(ctx context.Context, event StreamEvent) {
 		return
 	}
 	_ = emit(event)
+}
+
+func emitAnswerDeltas(ctx context.Context, answer string) {
+	text := strings.TrimSpace(answer)
+	if text == "" {
+		return
+	}
+	runes := []rune(text)
+	const chunkSize = 10
+	for start := 0; start < len(runes); start += chunkSize {
+		end := start + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+		emitStreamEvent(ctx, StreamEvent{Type: "message", Message: string(runes[start:end])})
+		if end < len(runes) {
+			time.Sleep(18 * time.Millisecond)
+		}
+	}
 }
 
 func extractDisplayContent(msg *schema.Message) string {

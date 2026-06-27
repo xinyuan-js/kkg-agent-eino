@@ -363,12 +363,17 @@ async function runAgentStream(prompt: string, assistantMessageId: string) {
         continue
       }
       const event = JSON.parse(trimmed) as StreamEvent
-      applyStreamEvent(event, assistantMessageId)
+      await applyStreamEvent(event, assistantMessageId)
     }
+  }
+  const tail = buffer.trim()
+  if (tail) {
+    const event = JSON.parse(tail) as StreamEvent
+    await applyStreamEvent(event, assistantMessageId)
   }
 }
 
-function applyStreamEvent(event: StreamEvent, assistantMessageId: string) {
+async function applyStreamEvent(event: StreamEvent, assistantMessageId: string) {
   if (event.session_id) {
     sessionId.value = event.session_id
   }
@@ -381,9 +386,16 @@ function applyStreamEvent(event: StreamEvent, assistantMessageId: string) {
   if (event.type === 'error') {
     updateAssistantMessage(assistantMessageId, `请求失败：${event.message || 'unknown error'}`)
   }
+  if (event.type === 'message' && event.message) {
+    appendAssistantMessage(assistantMessageId, event.message)
+    await nextTick()
+    scrollConversationToBottom()
+  }
   if (event.done) {
     result.value = event.done
-    updateAssistantMessage(assistantMessageId, String(event.done.answer || ''))
+    reconcileAssistantMessage(assistantMessageId, String(event.done.answer || ''))
+    await nextTick()
+    scrollConversationToBottom()
   }
 }
 
@@ -393,6 +405,30 @@ function updateAssistantMessage(id: string, content: string) {
     return
   }
   item.content = content
+}
+
+function appendAssistantMessage(id: string, delta: string) {
+  const item = messages.value.find((message) => message.id === id)
+  if (!item || !delta) {
+    return
+  }
+  item.content += delta
+}
+
+function reconcileAssistantMessage(id: string, finalContent: string) {
+  const item = messages.value.find((message) => message.id === id)
+  if (!item || !finalContent) {
+    return
+  }
+  if (!item.content || item.content === finalContent) {
+    item.content = finalContent
+    return
+  }
+  if (finalContent.startsWith(item.content)) {
+    item.content += finalContent.slice(item.content.length)
+    return
+  }
+  item.content = finalContent
 }
 
 function scrollConversationToBottom() {
@@ -494,8 +530,8 @@ function renderMarkdown(markdown: string) {
     if (heading) {
       closeParagraph()
       closeList()
-      const level = heading[1].length
-      html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`)
+      const level = (heading[1] || '').length
+      html.push(`<h${level}>${renderInline(heading[2] || '')}</h${level}>`)
       continue
     }
 
@@ -506,7 +542,7 @@ function renderMarkdown(markdown: string) {
         html.push('<ul>')
         listOpen = true
       }
-      html.push(`<li>${renderInline(listItem[1])}</li>`)
+      html.push(`<li>${renderInline(listItem[1] || '')}</li>`)
       continue
     }
 
