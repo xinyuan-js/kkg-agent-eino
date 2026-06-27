@@ -59,14 +59,14 @@ type ListSubmissionsInput struct {
 	PageSize   int64 `json:"page_size,omitempty" jsonschema_description:"每页数量，默认 5，最大 20"`
 	QuestionID int64 `json:"question_id,omitempty" jsonschema_description:"OJ 题目 ID"`
 	UserID     int64 `json:"user_id,omitempty" jsonschema_description:"用户 ID，普通用户只能查询自己"`
-	Status     int32 `json:"status,omitempty" jsonschema_description:"提交状态"`
+	Status     int32 `json:"status,omitempty" jsonschema_description:"提交状态：0 pending，1 running，2 accepted，通过，3 rejected，未通过，4 system_error"`
 }
 
 type GetSubmissionResultInput struct {
-	SubmissionID int64 `json:"submission_id" jsonschema:"required" jsonschema_description:"提交记录 ID"`
-	QuestionID   int64 `json:"question_id,omitempty" jsonschema_description:"可选，用于缩小查询范围"`
+	SubmissionID int64 `json:"submission_id,omitempty" jsonschema_description:"可选，提交记录 ID；按提交 ID 查询时只传 submission_id 即可，不需要 question_id"`
+	QuestionID   int64 `json:"question_id,omitempty" jsonschema_description:"可选，仅在 submission_id 为空时用于查询该题最新提交；不是按 submission_id 查询的必填项"`
 	UserID       int64 `json:"user_id,omitempty" jsonschema_description:"可选，普通用户通常留空或仅查询自己"`
-	MaxPages     int64 `json:"max_pages,omitempty" jsonschema_description:"扫描提交列表的最大页数，默认 5，最大 20"`
+	MaxPages     int64 `json:"max_pages,omitempty" jsonschema_description:"扫描提交列表的最大页数，默认 5，最大 20。返回 status_label 和 passed 判断是否通过"`
 }
 
 type ListQuestionSolutionsInput struct {
@@ -210,7 +210,25 @@ func newRunCodeTool(client *kkg.Client) (einotool.BaseTool, error) {
 }
 
 func newSubmitSolutionTool(client *kkg.Client) (einotool.BaseTool, error) {
-	return utils.InferEnhancedTool("kkg_oj_submit_solution", "正式提交代码到 KKG OJ 判题。需要登录态，目前仅支持 Go，且受提交频率限制。", func(ctx context.Context, input SubmitSolutionInput) (*schema.ToolResult, error) {
+	return utils.InferEnhancedTool("kkg_oj_submit_solution", "正式提交代码到 KKG OJ 判题。调用前必须已经获得用户明确确认，例如用户回复“确认提交”。需要登录态，目前仅支持 Go，且受提交频率限制。", func(ctx context.Context, input SubmitSolutionInput) (*schema.ToolResult, error) {
+		if !submitConfirmedFromContext(ctx) {
+			language := input.Language
+			if language == "" {
+				language = "go"
+			}
+			return newToolResult(ResultPayload{
+				Tool:    "kkg_oj_submit_solution",
+				OK:      true,
+				Summary: "approval required",
+				Data: map[string]any{
+					"approval_required": true,
+					"question_id":       input.QuestionID,
+					"language":          language,
+					"code_chars":        len([]rune(strings.TrimSpace(input.Code))),
+					"code_lines":        countLines(input.Code),
+				},
+			})
+		}
 		return executeTool(ctx, "kkg_oj_submit_solution", func(ctx context.Context) (any, error) {
 			if input.QuestionID <= 0 {
 				return nil, fmt.Errorf("question_id is required")
@@ -226,7 +244,7 @@ func newSubmitSolutionTool(client *kkg.Client) (einotool.BaseTool, error) {
 				Language: language, Code: input.Code, QuestionID: input.QuestionID,
 			})
 		}, func(out any) string {
-			return "submitted"
+			return submitSummary(out)
 		})
 	})
 }
@@ -234,16 +252,12 @@ func newSubmitSolutionTool(client *kkg.Client) (einotool.BaseTool, error) {
 func newListSubmissionsTool(client *kkg.Client) (einotool.BaseTool, error) {
 	return utils.InferEnhancedTool("kkg_oj_list_submissions", "分页读取 KKG OJ 提交记录。需要登录态，普通用户只能查看自己的提交。", func(ctx context.Context, input ListSubmissionsInput) (*schema.ToolResult, error) {
 		return executeTool(ctx, "kkg_oj_list_submissions", func(ctx context.Context) (*kkg.PageResult, error) {
-			userID, err := scopedUserID(ctx, input.UserID)
-			if err != nil {
-				return nil, err
-			}
 			input.Current = clampInt64Min(input.Current, 1)
 			input.PageSize = clampInt64(input.PageSize, 5, 20)
 			return client.ListSubmissions(ctx, toolContext(ctx), kkg.SubmissionListRequest{
 				PageRequest: kkg.PageRequest{Current: input.Current, PageSize: input.PageSize},
 				QuestionID:  input.QuestionID,
-				UserID:      userID,
+				UserID:      input.UserID,
 				Status:      input.Status,
 			})
 		}, summarizePageResult)
@@ -251,20 +265,11 @@ func newListSubmissionsTool(client *kkg.Client) (einotool.BaseTool, error) {
 }
 
 func newGetSubmissionResultTool(client *kkg.Client) (einotool.BaseTool, error) {
-	return utils.InferEnhancedTool("kkg_oj_get_submission_result", "查询一条 OJ 提交记录的结果。基于已有提交列表接口分页扫描定位指定 submission_id，需要登录态。", func(ctx context.Context, input GetSubmissionResultInput) (*schema.ToolResult, error) {
+	return utils.InferEnhancedTool("kkg_oj_get_submission_result", "查询 OJ 提交记录是否通过。调用方式：已知提交 ID 时只传 submission_id；没有提交 ID 但有题号时传 question_id 查询该题最新提交；两者都没有时查询当前用户最新提交。需要登录态。", func(ctx context.Context, input GetSubmissionResultInput) (*schema.ToolResult, error) {
 		return executeTool(ctx, "kkg_oj_get_submission_result", func(ctx context.Context) (map[string]any, error) {
-			userID, err := scopedUserID(ctx, input.UserID)
-			if err != nil {
-				return nil, err
-			}
 			input.MaxPages = clampInt64(input.MaxPages, 5, 20)
-			return client.GetSubmissionResult(ctx, toolContext(ctx), input.SubmissionID, input.QuestionID, userID, input.MaxPages)
-		}, func(out map[string]any) string {
-			if out == nil {
-				return fmt.Sprintf("submission %d", input.SubmissionID)
-			}
-			return fmt.Sprintf("submission %d", input.SubmissionID)
-		})
+			return client.GetSubmissionResult(ctx, toolContext(ctx), input.SubmissionID, input.QuestionID, input.UserID, input.MaxPages)
+		}, submissionResultSummary(input.SubmissionID))
 	})
 }
 
@@ -309,4 +314,68 @@ func clampInt64Min(value, minValue int64) int64 {
 		return minValue
 	}
 	return value
+}
+
+func submitSummary(out any) string {
+	record, ok := out.(map[string]any)
+	if !ok {
+		return "submitted"
+	}
+	id := compactToolValue(record["submission_id"])
+	if id == "" {
+		id = compactToolValue(record["id"])
+	}
+	status := compactToolValue(record["status_label"])
+	if id == "" && status == "" {
+		return "submitted"
+	}
+	if id == "" {
+		return "submitted " + status
+	}
+	if status == "" {
+		return "submission " + id
+	}
+	return "submission " + id + " " + status
+}
+
+func submissionResultSummary(submissionID int64) func(map[string]any) string {
+	return func(out map[string]any) string {
+		id := ""
+		if submissionID > 0 {
+			id = fmt.Sprintf("%d", submissionID)
+		}
+		if out != nil {
+			if value := compactToolValue(out["id"]); value != "" {
+				id = value
+			}
+			if value := compactToolValue(out["submission_id"]); value != "" {
+				id = value
+			}
+			if status := compactToolValue(out["status_label"]); status != "" {
+				if id == "" {
+					return "latest submission " + status
+				}
+				return "submission " + id + " " + status
+			}
+		}
+		if id == "" {
+			return "latest submission"
+		}
+		return "submission " + id
+	}
+}
+
+func compactToolValue(value any) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func countLines(code string) int {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return 0
+	}
+	return strings.Count(code, "\n") + 1
 }

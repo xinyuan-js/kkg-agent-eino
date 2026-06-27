@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/callbacks"
+	"github.com/cloudwego/eino/components"
 	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 )
@@ -65,26 +67,34 @@ func (m *ChatModel) WithTools(tools []*schema.ToolInfo) (einomodel.ToolCallingCh
 	return &next, nil
 }
 
+func (m *ChatModel) GetType() string {
+	return "deepseek_chat_model"
+}
+
+func (m *ChatModel) IsCallbacksEnabled() bool {
+	return true
+}
+
 func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.Message, error) {
 	reqBody, tools := m.buildRequest(input, opts...)
-	respMsg, err := m.generateOnce(ctx, reqBody)
+	ctx = callbacks.EnsureRunInfo(ctx, m.GetType(), components.ComponentOfChatModel)
+	ctx = callbacks.OnStart(ctx, &einomodel.CallbackInput{
+		Messages: input,
+		Tools:    tools,
+		Config:   callbackConfig(reqBody),
+	})
+	resp, err := m.generateWithToolProtocolRepair(ctx, reqBody, tools)
 	if err != nil {
+		callbacks.OnError(ctx, err)
 		return nil, err
 	}
-	if len(tools) > 0 && violatesToolCallProtocol(respMsg) {
-		reqBody.Messages = append(reqBody.Messages, respMsg, chatMessage{
-			Role:    string(schema.System),
-			Content: toolCallProtocolRepairInstruction,
-		})
-		respMsg, err = m.generateOnce(ctx, reqBody)
-		if err != nil {
-			return nil, err
-		}
-		if violatesToolCallProtocol(respMsg) {
-			return nil, fmt.Errorf("deepseek returned non-standard tool invocation content; expected structured tool_calls")
-		}
-	}
-	return fromDeepSeekMessage(respMsg), nil
+	out := attachResponseMeta(fromDeepSeekMessage(resp.Message), resp.Usage, resp.FinishReason)
+	callbacks.OnEnd(ctx, &einomodel.CallbackOutput{
+		Message:    out,
+		Config:     callbackConfig(reqBody),
+		TokenUsage: toModelTokenUsage(out.ResponseMeta),
+	})
+	return out, nil
 }
 
 func (m *ChatModel) buildRequest(input []*schema.Message, opts ...einomodel.Option) (chatRequest, []*schema.ToolInfo) {
@@ -127,26 +137,65 @@ func (m *ChatModel) buildRequest(input []*schema.Message, opts ...einomodel.Opti
 }
 
 func (m *ChatModel) Stream(ctx context.Context, input []*schema.Message, opts ...einomodel.Option) (*schema.StreamReader[*schema.Message], error) {
-	reqBody, _ := m.buildRequest(input, opts...)
+	reqBody, tools := m.buildRequest(input, opts...)
 	reqBody.Stream = true
+	reqBody.StreamOptions = &streamOptions{IncludeUsage: true}
+	ctx = callbacks.EnsureRunInfo(ctx, m.GetType(), components.ComponentOfChatModel)
+	ctx = callbacks.OnStart(ctx, &einomodel.CallbackInput{
+		Messages: input,
+		Tools:    tools,
+		Config:   callbackConfig(reqBody),
+	})
 	reader, writer := schema.Pipe[*schema.Message](1)
 	go func() {
 		defer writer.Close()
-		if err := m.streamOnce(ctx, reqBody, writer); err != nil {
-			writer.Send(nil, err)
+		if len(tools) > 0 {
+			// Tool calls must arrive as structured tool_calls. Buffering this path avoids
+			// leaking textual pseudo-calls from models that do not reliably stream tools.
+			nonStreamReq := reqBody
+			nonStreamReq.Stream = false
+			nonStreamReq.StreamOptions = nil
+			resp, err := m.generateWithToolProtocolRepair(ctx, nonStreamReq, tools)
+			if err != nil {
+				callbacks.OnError(ctx, err)
+				writer.Send(nil, err)
+				return
+			}
+			out := attachResponseMeta(fromDeepSeekMessage(resp.Message), resp.Usage, resp.FinishReason)
+			writer.Send(out, nil)
+			callbacks.OnEnd(ctx, &einomodel.CallbackOutput{
+				Message:    out,
+				Config:     callbackConfig(nonStreamReq),
+				TokenUsage: toModelTokenUsage(out.ResponseMeta),
+			})
+			return
 		}
+
+		if err := m.streamOnce(ctx, reqBody, writer); err != nil {
+			callbacks.OnError(ctx, err)
+			writer.Send(nil, err)
+			return
+		}
+		callbacks.OnEnd(ctx, &einomodel.CallbackOutput{
+			Config: callbackConfig(reqBody),
+		})
 	}()
 	return reader, nil
 }
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature *float32      `json:"temperature,omitempty"`
-	TopP        *float32      `json:"top_p,omitempty"`
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
-	Tools       []chatTool    `json:"tools,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
+	Model         string         `json:"model"`
+	Messages      []chatMessage  `json:"messages"`
+	Temperature   *float32       `json:"temperature,omitempty"`
+	TopP          *float32       `json:"top_p,omitempty"`
+	MaxTokens     *int           `json:"max_tokens,omitempty"`
+	Tools         []chatTool     `json:"tools,omitempty"`
+	Stream        bool           `json:"stream,omitempty"`
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessage struct {
@@ -182,14 +231,36 @@ type toolFunction struct {
 
 type chatResponse struct {
 	Choices []struct {
-		Message chatMessage `json:"message"`
+		Message      chatMessage `json:"message"`
+		FinishReason string      `json:"finish_reason"`
 	} `json:"choices"`
+	Usage tokenUsage `json:"usage"`
 }
 
 type chatStreamResponse struct {
 	Choices []struct {
-		Delta chatMessage `json:"delta"`
+		Delta        chatMessage `json:"delta"`
+		FinishReason string      `json:"finish_reason"`
 	} `json:"choices"`
+	Usage tokenUsage `json:"usage"`
+}
+
+type chatResult struct {
+	Message      chatMessage
+	Usage        tokenUsage
+	FinishReason string
+}
+
+type tokenUsage struct {
+	PromptTokens       int `json:"prompt_tokens"`
+	CompletionTokens   int `json:"completion_tokens"`
+	TotalTokens        int `json:"total_tokens"`
+	PromptTokenDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
 }
 
 func toDeepSeekMessage(msg *schema.Message) chatMessage {
@@ -257,7 +328,74 @@ func fromDeepSeekMessage(msg chatMessage) *schema.Message {
 			},
 		})
 	}
-	return schema.AssistantMessage(strings.TrimSpace(msg.Content), toolCalls)
+	return schema.AssistantMessage(msg.Content, toolCalls)
+}
+
+func callbackConfig(req chatRequest) *einomodel.Config {
+	cfg := &einomodel.Config{Model: req.Model}
+	if req.MaxTokens != nil {
+		cfg.MaxTokens = *req.MaxTokens
+	}
+	if req.Temperature != nil {
+		cfg.Temperature = *req.Temperature
+	}
+	if req.TopP != nil {
+		cfg.TopP = *req.TopP
+	}
+	return cfg
+}
+
+func attachResponseMeta(msg *schema.Message, usage tokenUsage, finishReason string) *schema.Message {
+	if msg == nil {
+		msg = schema.AssistantMessage("", nil)
+	}
+	if finishReason == "" && usage.empty() {
+		return msg
+	}
+	msg.ResponseMeta = &schema.ResponseMeta{
+		FinishReason: finishReason,
+		Usage:        usage.toSchema(),
+	}
+	return msg
+}
+
+func (u tokenUsage) empty() bool {
+	return u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 &&
+		u.PromptTokenDetails.CachedTokens == 0 && u.CompletionTokensDetails.ReasoningTokens == 0
+}
+
+func (u tokenUsage) toSchema() *schema.TokenUsage {
+	if u.empty() {
+		return nil
+	}
+	return &schema.TokenUsage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		PromptTokenDetails: schema.PromptTokenDetails{
+			CachedTokens: u.PromptTokenDetails.CachedTokens,
+		},
+		CompletionTokensDetails: schema.CompletionTokensDetails{
+			ReasoningTokens: u.CompletionTokensDetails.ReasoningTokens,
+		},
+	}
+}
+
+func toModelTokenUsage(meta *schema.ResponseMeta) *einomodel.TokenUsage {
+	if meta == nil || meta.Usage == nil {
+		return nil
+	}
+	return &einomodel.TokenUsage{
+		PromptTokens:     meta.Usage.PromptTokens,
+		CompletionTokens: meta.Usage.CompletionTokens,
+		TotalTokens:      meta.Usage.TotalTokens,
+		PromptTokenDetails: einomodel.PromptTokenDetails{
+			CachedTokens: meta.Usage.PromptTokenDetails.CachedTokens,
+		},
+		CompletionTokensDetails: einomodel.CompletionTokensDetails{
+			ReasoningTokens: meta.Usage.CompletionTokensDetails.ReasoningTokens,
+		},
+	}
 }
 
 func toDeepSeekTool(info *schema.ToolInfo) chatTool {
@@ -286,14 +424,14 @@ func compactError(body []byte) string {
 	return value
 }
 
-func (m *ChatModel) generateOnce(ctx context.Context, reqBody chatRequest) (chatMessage, error) {
+func (m *ChatModel) generateOnce(ctx context.Context, reqBody chatRequest) (chatResult, error) {
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
-		return chatMessage{}, err
+		return chatResult{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.baseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return chatMessage{}, err
+		return chatResult{}, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
@@ -301,25 +439,53 @@ func (m *ChatModel) generateOnce(ctx context.Context, reqBody chatRequest) (chat
 
 	resp, err := m.http.Do(req)
 	if err != nil {
-		return chatMessage{}, err
+		return chatResult{}, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return chatMessage{}, err
+		return chatResult{}, err
 	}
 	if resp.StatusCode >= 400 {
-		return chatMessage{}, fmt.Errorf("deepseek chat completions returned %d: %s", resp.StatusCode, compactError(body))
+		return chatResult{}, fmt.Errorf("deepseek chat completions returned %d: %s", resp.StatusCode, compactError(body))
 	}
 
 	var out chatResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return chatMessage{}, err
+		return chatResult{}, err
 	}
 	if len(out.Choices) == 0 {
-		return chatMessage{}, fmt.Errorf("deepseek chat completions returned no choices")
+		return chatResult{}, fmt.Errorf("deepseek chat completions returned no choices")
 	}
-	return out.Choices[0].Message, nil
+	return chatResult{
+		Message:      out.Choices[0].Message,
+		Usage:        out.Usage,
+		FinishReason: out.Choices[0].FinishReason,
+	}, nil
+}
+
+func (m *ChatModel) generateWithToolProtocolRepair(ctx context.Context, reqBody chatRequest, tools []*schema.ToolInfo) (chatResult, error) {
+	resp, err := m.generateOnce(ctx, reqBody)
+	if err != nil {
+		return chatResult{}, err
+	}
+	if len(tools) == 0 || !violatesToolCallProtocol(resp.Message) {
+		return resp, nil
+	}
+
+	repairReq := reqBody
+	repairReq.Messages = append(append([]chatMessage(nil), reqBody.Messages...), resp.Message, chatMessage{
+		Role:    string(schema.System),
+		Content: toolCallProtocolRepairInstruction,
+	})
+	resp, err = m.generateOnce(ctx, repairReq)
+	if err != nil {
+		return chatResult{}, err
+	}
+	if violatesToolCallProtocol(resp.Message) {
+		return chatResult{}, fmt.Errorf("deepseek returned non-standard tool invocation content; expected structured tool_calls")
+	}
+	return resp, nil
 }
 
 func (m *ChatModel) streamOnce(ctx context.Context, reqBody chatRequest, writer *schema.StreamWriter[*schema.Message]) error {
@@ -368,13 +534,17 @@ func (m *ChatModel) streamOnce(ctx context.Context, reqBody chatRequest, writer 
 			return fmt.Errorf("decode deepseek stream chunk: %w", err)
 		}
 		if len(chunk.Choices) == 0 {
+			if !chunk.Usage.empty() {
+				writer.Send(attachResponseMeta(schema.AssistantMessage("", nil), chunk.Usage, ""), nil)
+			}
 			continue
 		}
 		msg := fromDeepSeekMessage(chunk.Choices[0].Delta)
+		msg = attachResponseMeta(msg, chunk.Usage, chunk.Choices[0].FinishReason)
 		if msg.Role == "" {
 			msg.Role = schema.Assistant
 		}
-		if strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 {
+		if strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 && (msg.ResponseMeta == nil || msg.ResponseMeta.Usage == nil) {
 			continue
 		}
 		writer.Send(msg, nil)

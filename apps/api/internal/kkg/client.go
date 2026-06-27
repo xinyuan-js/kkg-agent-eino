@@ -181,7 +181,7 @@ func (c *Client) SearchPosts(ctx context.Context, toolCtx ToolContext, q string,
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg blog search failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg blog search failed")
 	}
 	return &envelope.Data, nil
 }
@@ -198,7 +198,7 @@ func (c *Client) ListBlogPosts(ctx context.Context, toolCtx ToolContext, limit i
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg blog list posts failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg blog list posts failed")
 	}
 	return envelope.Data, nil
 }
@@ -213,7 +213,7 @@ func (c *Client) GetBlogPost(ctx context.Context, toolCtx ToolContext, id int64)
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg blog get post failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg blog get post failed")
 	}
 	return envelope.Data, nil
 }
@@ -230,7 +230,7 @@ func (c *Client) GetBlogPostComments(ctx context.Context, toolCtx ToolContext, p
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg blog get comments failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg blog get comments failed")
 	}
 	return envelope.Data, nil
 }
@@ -247,13 +247,13 @@ func (c *Client) GetQuestion(ctx context.Context, toolCtx ToolContext, id int64)
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg oj question get failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg oj question get failed")
 	}
 	return &envelope.Data, nil
 }
 
 func (c *Client) ListQuestions(ctx context.Context, toolCtx ToolContext, req PageRequest) (*PageResult, error) {
-	req = normalizePage(req, 5, 20)
+	req = normalizePage(req, 5, 50)
 	var envelope struct {
 		Code    int        `json:"code"`
 		Message string     `json:"message"`
@@ -263,7 +263,7 @@ func (c *Client) ListQuestions(ctx context.Context, toolCtx ToolContext, req Pag
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg oj list questions failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg oj list questions failed")
 	}
 	return &envelope.Data, nil
 }
@@ -278,7 +278,7 @@ func (c *Client) RunCode(ctx context.Context, toolCtx ToolContext, req CodeRunRe
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg oj run code failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg oj run code failed")
 	}
 	return envelope.Data, nil
 }
@@ -293,9 +293,9 @@ func (c *Client) SubmitSolution(ctx context.Context, toolCtx ToolContext, req Co
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg oj submit solution failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg oj submit solution failed")
 	}
-	return envelope.Data, nil
+	return normalizeSubmitResponse(envelope.Data, req.QuestionID), nil
 }
 
 func (c *Client) ListSubmissions(ctx context.Context, toolCtx ToolContext, req SubmissionListRequest) (*PageResult, error) {
@@ -309,15 +309,13 @@ func (c *Client) ListSubmissions(ctx context.Context, toolCtx ToolContext, req S
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg oj list submissions failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg oj list submissions failed")
 	}
+	envelope.Data.Records = normalizeSubmissionRecords(envelope.Data.Records)
 	return &envelope.Data, nil
 }
 
 func (c *Client) GetSubmissionResult(ctx context.Context, toolCtx ToolContext, submissionID, questionID, userID int64, maxPages int64) (map[string]any, error) {
-	if submissionID <= 0 {
-		return nil, fmt.Errorf("submission id is required")
-	}
 	if maxPages <= 0 {
 		maxPages = 5
 	}
@@ -332,20 +330,28 @@ func (c *Client) GetSubmissionResult(ctx context.Context, toolCtx ToolContext, s
 				SortField: "createTime",
 				SortOrder: "descend",
 			},
-			ID:         submissionID,
 			QuestionID: questionID,
 			UserID:     userID,
 		})
 		if err != nil {
 			return nil, err
 		}
+		if submissionID <= 0 {
+			record, found := firstSubmissionRecord(page.Records)
+			if found {
+				return normalizeSubmissionRecord(record), nil
+			}
+		}
 		record, found := findSubmissionRecord(page.Records, submissionID)
 		if found {
-			return record, nil
+			return normalizeSubmissionRecord(record), nil
 		}
 		if page == nil || page.Size <= 0 || current*page.Size >= page.Total {
 			break
 		}
+	}
+	if submissionID <= 0 {
+		return nil, APIError{StatusCode: http.StatusNotFound, Message: "latest submission not found"}
 	}
 	return nil, APIError{StatusCode: http.StatusNotFound, Message: fmt.Sprintf("submission %d not found", submissionID)}
 }
@@ -361,7 +367,7 @@ func (c *Client) ListQuestionSolutions(ctx context.Context, toolCtx ToolContext,
 		return nil, err
 	}
 	if envelope.Code != 0 {
-		return nil, fmt.Errorf("kkg oj list question solutions failed: %s", envelope.Message)
+		return nil, apiEnvelopeError(envelope.Code, envelope.Message, "kkg oj list question solutions failed")
 	}
 	return &envelope.Data, nil
 }
@@ -407,10 +413,67 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, toolCtx To
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("kkg request failed: %s %s returned %d", method, endpoint, resp.StatusCode)
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if len(rawBody) > 0 {
+		if decodeErr := json.Unmarshal(rawBody, out); decodeErr != nil {
+			if resp.StatusCode >= 400 {
+				return APIError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("kkg request failed: %s %s returned %d", method, endpoint, resp.StatusCode)}
+			}
+			return decodeErr
+		}
+	}
+	if resp.StatusCode >= 400 {
+		message := fmt.Sprintf("kkg request failed: %s %s returned %d", method, endpoint, resp.StatusCode)
+		if bodyMessage := envelopeMessage(rawBody); bodyMessage != "" {
+			message = bodyMessage
+		}
+		return APIError{StatusCode: resp.StatusCode, Message: message}
+	}
+	return nil
+}
+
+func apiEnvelopeError(code int, message, fallback string) APIError {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = fallback
+	}
+	return APIError{StatusCode: statusFromBusinessCode(code), Message: message}
+}
+
+func statusFromBusinessCode(code int) int {
+	switch code {
+	case 400, 40000:
+		return http.StatusBadRequest
+	case 401, 40100:
+		return http.StatusUnauthorized
+	case 40101, 403, 40300:
+		return http.StatusForbidden
+	case 404, 40400:
+		return http.StatusNotFound
+	case 500, 50000, 50001, 50010:
+		return http.StatusInternalServerError
+	default:
+		if code >= 100 && code <= 599 {
+			return code
+		}
+		return http.StatusBadRequest
+	}
+}
+
+func envelopeMessage(rawBody []byte) string {
+	if len(rawBody) == 0 {
+		return ""
+	}
+	var envelope struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(rawBody, &envelope) != nil {
+		return ""
+	}
+	return strings.TrimSpace(envelope.Message)
 }
 
 func normalizeLimit(limit, fallback, max int) int {
@@ -436,6 +499,97 @@ func normalizePage(req PageRequest, fallbackSize, maxSize int64) PageRequest {
 	return req
 }
 
+func normalizeSubmitResponse(data any, questionID int64) any {
+	submissionID, ok := numericID(data)
+	if !ok {
+		record, isRecord := data.(map[string]any)
+		if !isRecord {
+			return data
+		}
+		return normalizeSubmissionRecord(record)
+	}
+	return map[string]any{
+		"submission_id": submissionID,
+		"question_id":   questionID,
+		"status":        int32(0),
+		"status_label":  "pending",
+		"passed":        false,
+		"message":       "submitted; judge result is pending, query kkg_oj_get_submission_result with submission_id",
+	}
+}
+
+func normalizeSubmissionRecords(records any) any {
+	items, ok := records.([]any)
+	if !ok {
+		return records
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		record, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		out = append(out, normalizeSubmissionRecord(record))
+	}
+	return out
+}
+
+func normalizeSubmissionRecord(record map[string]any) map[string]any {
+	if record == nil {
+		return nil
+	}
+	out := make(map[string]any, len(record)+4)
+	for key, value := range record {
+		out[key] = value
+	}
+	status, ok := numericStatus(out["status"])
+	if !ok {
+		return out
+	}
+	out["status"] = status
+	out["status_label"] = submissionStatusLabel(status)
+	out["passed"] = status == 2
+	if message := judgeMessage(out["judgeInfo"]); message != "" {
+		out["judge_message"] = message
+	}
+	return out
+}
+
+func submissionStatusLabel(status int32) string {
+	switch status {
+	case 0:
+		return "pending"
+	case 1:
+		return "running"
+	case 2:
+		return "accepted"
+	case 3:
+		return "rejected"
+	case 4:
+		return "system_error"
+	default:
+		return "unknown"
+	}
+}
+
+func judgeMessage(value any) string {
+	switch info := value.(type) {
+	case map[string]any:
+		if message, ok := info["message"].(string); ok {
+			return strings.TrimSpace(message)
+		}
+	case string:
+		var payload map[string]any
+		if json.Unmarshal([]byte(info), &payload) == nil {
+			if message, ok := payload["message"].(string); ok {
+				return strings.TrimSpace(message)
+			}
+		}
+	}
+	return ""
+}
+
 func findSubmissionRecord(records any, submissionID int64) (map[string]any, bool) {
 	items, ok := records.([]any)
 	if !ok {
@@ -453,19 +607,43 @@ func findSubmissionRecord(records any, submissionID int64) (map[string]any, bool
 	return nil, false
 }
 
+func firstSubmissionRecord(records any) (map[string]any, bool) {
+	items, ok := records.([]any)
+	if !ok || len(items) == 0 {
+		return nil, false
+	}
+	record, ok := items[0].(map[string]any)
+	return record, ok
+}
+
 func matchesSubmissionID(value any, submissionID int64) bool {
+	id, ok := numericID(value)
+	return ok && id == submissionID
+}
+
+func numericID(value any) (int64, bool) {
 	switch v := value.(type) {
 	case float64:
-		return int64(v) == submissionID
+		return int64(v), true
 	case int64:
-		return v == submissionID
+		return v, true
 	case int:
-		return int64(v) == submissionID
+		return int64(v), true
+	case json.Number:
+		id, err := v.Int64()
+		return id, err == nil
 	case string:
-		return strings.TrimSpace(v) == fmt.Sprintf("%d", submissionID)
+		var id int64
+		_, err := fmt.Sscan(strings.TrimSpace(v), &id)
+		return id, err == nil
 	default:
-		return false
+		return 0, false
 	}
+}
+
+func numericStatus(value any) (int32, bool) {
+	id, ok := numericID(value)
+	return int32(id), ok
 }
 
 func (c *Client) doAuthJSON(ctx context.Context, method, endpoint string, cookies []*http.Cookie, body any, out any) ([]*http.Cookie, error) {

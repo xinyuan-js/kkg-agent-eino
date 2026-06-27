@@ -2,10 +2,15 @@ package httpapi
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -168,6 +173,8 @@ func (s *Server) streamAgent(c *gin.Context) {
 	if !ok {
 		return
 	}
+	streamCtx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
 	c.Writer.Header().Set("Content-Type", "application/x-ndjson")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
@@ -177,22 +184,68 @@ func (s *Server) streamAgent(c *gin.Context) {
 		return
 	}
 	writer := bufio.NewWriter(c.Writer)
+	var (
+		writeMu  sync.Mutex
+		writeErr error
+		closed   bool
+	)
 	emit := func(event agent.StreamEvent) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		defer func() {
+			if r := recover(); r != nil {
+				writeErr = fmt.Errorf("stream writer panic: %v", r)
+				cancel()
+			}
+		}()
+		if closed {
+			return io.ErrClosedPipe
+		}
+		if writeErr != nil {
+			return writeErr
+		}
 		raw, err := json.Marshal(event)
 		if err != nil {
+			writeErr = err
+			cancel()
 			return err
 		}
 		if _, err := writer.Write(append(raw, '\n')); err != nil {
+			writeErr = err
+			cancel()
 			return err
 		}
 		if err := writer.Flush(); err != nil {
+			writeErr = err
+			cancel()
 			return err
 		}
 		flusher.Flush()
 		return nil
 	}
-	_, err := s.agent.Stream(c.Request.Context(), req, emit)
-	if err != nil {
+	done := make(chan struct{})
+	defer func() {
+		writeMu.Lock()
+		closed = true
+		writeMu.Unlock()
+		close(done)
+	}()
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = emit(agent.StreamEvent{Type: "heartbeat", SessionID: req.SessionID})
+			}
+		}
+	}()
+	_, err := s.agent.Stream(streamCtx, req, emit)
+	if err != nil && writeErr == nil {
 		_ = emit(agent.StreamEvent{Type: "error", Message: err.Error(), SessionID: req.SessionID})
 	}
 }

@@ -9,9 +9,10 @@ import (
 )
 
 const (
-	SessionKeyAccessToken = "kkg_access_token"
-	SessionKeyUserID      = "kkg_user_id"
-	SessionKeyRequestID   = "kkg_request_id"
+	SessionKeyAccessToken     = "kkg_access_token"
+	SessionKeyUserID          = "kkg_user_id"
+	SessionKeyRequestID       = "kkg_request_id"
+	SessionKeySubmitConfirmed = "kkg_submit_confirmed"
 )
 
 func accessTokenFromContext(ctx context.Context) string {
@@ -49,4 +50,19 @@ func scopedUserID(ctx context.Context, requested int64) (int64, error) {
 		return 0, fmt.Errorf("user_id does not match current session")
 	}
 	return current, nil
+}
+
+func submitConfirmedFromContext(ctx context.Context) bool {
+	value, ok := adk.GetSessionValue(ctx, SessionKeySubmitConfirmed)
+	if !ok {
+		return false
+	}
+	switch confirmed := value.(type) {
+	case bool:
+		return confirmed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(confirmed), "true")
+	default:
+		return false
+	}
 }

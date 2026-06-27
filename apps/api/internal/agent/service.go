@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,115 +22,6 @@ import (
 	"kkg-agent-eino/apps/api/internal/memory"
 	"kkg-agent-eino/apps/api/internal/rag"
 )
-
-type Mode string
-
-const (
-	ModeChain Mode = "chain"
-	ModeGraph Mode = "graph"
-)
-
-const (
-	routerAgentName   = "kkg_router_agent"
-	platformAgentName = "kkg_platform_agent"
-	blogAgentName     = "kkg_blog_agent"
-	questionAgentName = "kkg_question_agent"
-)
-
-type RunRequest struct {
-	Query       string `json:"query"`
-	Mode        Mode   `json:"mode"`
-	QuestionID  int64  `json:"question_id,omitempty"`
-	SessionID   string `json:"session_id,omitempty"`
-	Language    string `json:"language,omitempty"`
-	Code        string `json:"code,omitempty"`
-	Input       string `json:"input,omitempty"`
-	Submit      bool   `json:"submit,omitempty"`
-	UserID      int64  `json:"-"`
-	AccessToken string `json:"-"`
-	RequestID   string `json:"request_id,omitempty"`
-}
-
-type RunResponse struct {
-	Mode        Mode           `json:"mode"`
-	SessionID   string         `json:"session_id,omitempty"`
-	Answer      string         `json:"answer"`
-	RAGDocs     []rag.Document `json:"rag_docs"`
-	ToolTrace   []ToolTrace    `json:"tool_trace"`
-	ToolResults []ToolResult   `json:"tool_results,omitempty"`
-	LatencyMS   int64          `json:"latency_ms"`
-	RequestID   string         `json:"request_id,omitempty"`
-}
-
-type StreamEvent struct {
-	Type      string         `json:"type"`
-	SessionID string         `json:"session_id,omitempty"`
-	Message   string         `json:"message,omitempty"`
-	Trace     *ToolTrace     `json:"trace,omitempty"`
-	Result    *ToolResult    `json:"result,omitempty"`
-	RAGDocs   []rag.Document `json:"rag_docs,omitempty"`
-	Done      *RunResponse   `json:"done,omitempty"`
-}
-
-type ConversationMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type ConversationSession struct {
-	ID           string                `json:"id"`
-	Title        string                `json:"title"`
-	LastMessage  string                `json:"last_message,omitempty"`
-	MessageCount int                   `json:"message_count"`
-	LastActiveAt string                `json:"last_active_at,omitempty"`
-	Archived     bool                  `json:"archived"`
-	Messages     []ConversationMessage `json:"messages,omitempty"`
-}
-
-type ToolTrace struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
-}
-
-type ToolResult struct {
-	Name    string                `json:"name"`
-	Status  string                `json:"status"`
-	Summary string                `json:"summary,omitempty"`
-	Data    any                   `json:"data,omitempty"`
-	Error   *kkgtools.ResultError `json:"error,omitempty"`
-}
-
-type RAGSearchInput struct {
-	Query string `json:"query" jsonschema:"required" jsonschema_description:"检索题库知识、相似题或练习题的查询文本"`
-	TopK  int    `json:"top_k,omitempty" jsonschema_description:"最大返回数量，默认 8，最大 12"`
-}
-
-type Service struct {
-	retriever rag.Retriever
-	chatModel einomodel.BaseChatModel
-	tools     []einotool.BaseTool
-	runner    *adk.Runner
-	memory    memory.Store
-	chain     compose.Runnable[RunRequest, RunResponse]
-	graph     compose.Runnable[RunRequest, RunResponse]
-}
-
-type workState struct {
-	Request        RunRequest
-	Query          string
-	SessionID      string
-	RAGDocs        []rag.Document
-	History        []*schema.Message
-	Messages       []*schema.Message
-	TurnMessages   []*schema.Message
-	FinalAnswer    string
-	StreamedAnswer bool
-	ToolTrace      []ToolTrace
-	ToolResults    []ToolResult
-	StartedAt      time.Time
-	Normalized     bool
-}
 
 func NewService(retriever rag.Retriever, kkgClient *kkg.Client, chatModel einomodel.BaseChatModel, memoryStore memory.Store) (*Service, error) {
 	if chatModel == nil {
@@ -342,18 +235,21 @@ func (s *Service) run(ctx context.Context, req RunRequest, emit func(StreamEvent
 }
 
 func (s *Service) invokeWithEmitter(ctx context.Context, runnable compose.Runnable[RunRequest, RunResponse], req RunRequest, emit func(StreamEvent) error) (RunResponse, error) {
+	ctx = context.WithValue(ctx, callbackTraceRecorderKey{}, &callbackTraceRecorder{})
 	if emit == nil {
-		return runnable.Invoke(ctx, req)
+		return runnable.Invoke(ctx, req, compose.WithCallbacks(observabilityCallback()))
 	}
 	ctx = context.WithValue(ctx, streamEmitterKey{}, emit)
-	return runnable.Invoke(ctx, req)
+	return runnable.Invoke(ctx, req, compose.WithCallbacks(observabilityCallback()))
 }
 
 func (s *Service) compileChain(ctx context.Context) (compose.Runnable[RunRequest, RunResponse], error) {
 	c := compose.NewChain[RunRequest, RunResponse]()
 	c.AppendLambda(compose.InvokableLambda(s.normalize), compose.WithNodeName("normalize"))
 	c.AppendLambda(compose.InvokableLambda(s.prepareSession), compose.WithNodeName("prepare_session"))
+	c.AppendLambda(compose.InvokableLambda(s.classifyRequest), compose.WithNodeName("classify_request"))
 	c.AppendLambda(compose.InvokableLambda(s.executeRouterAgent), compose.WithNodeName("adk_chat_model_agent"))
+	c.AppendLambda(compose.InvokableLambda(s.postprocessAnswer), compose.WithNodeName("postprocess_answer"))
 	c.AppendLambda(compose.InvokableLambda(s.persistSession), compose.WithNodeName("persist_session"))
 	c.AppendLambda(compose.InvokableLambda(s.buildResponse), compose.WithNodeName("build_response"))
 	return c.Compile(ctx, compose.WithGraphName("kkg_agent_chain"))
@@ -364,10 +260,19 @@ func (s *Service) compileGraph(ctx context.Context) (compose.Runnable[RunRequest
 	if err := g.AddLambdaNode("normalize", compose.InvokableLambda(s.normalize)); err != nil {
 		return nil, err
 	}
+	if err := g.AddLambdaNode("classify_request", compose.InvokableLambda(s.classifyRequest)); err != nil {
+		return nil, err
+	}
 	if err := g.AddLambdaNode("prepare_session", compose.InvokableLambda(s.prepareSession)); err != nil {
 		return nil, err
 	}
+	if err := g.AddLambdaNode("direct_answer", compose.InvokableLambda(s.directAnswer)); err != nil {
+		return nil, err
+	}
 	if err := g.AddLambdaNode("adk_chat_model_agent", compose.InvokableLambda(s.executeRouterAgent)); err != nil {
+		return nil, err
+	}
+	if err := g.AddLambdaNode("postprocess_answer", compose.InvokableLambda(s.postprocessAnswer)); err != nil {
 		return nil, err
 	}
 	if err := g.AddLambdaNode("persist_session", compose.InvokableLambda(s.persistSession)); err != nil {
@@ -379,8 +284,10 @@ func (s *Service) compileGraph(ctx context.Context) (compose.Runnable[RunRequest
 	edges := [][2]string{
 		{compose.START, "normalize"},
 		{"normalize", "prepare_session"},
-		{"prepare_session", "adk_chat_model_agent"},
-		{"adk_chat_model_agent", "persist_session"},
+		{"prepare_session", "classify_request"},
+		{"direct_answer", "postprocess_answer"},
+		{"adk_chat_model_agent", "postprocess_answer"},
+		{"postprocess_answer", "persist_session"},
 		{"persist_session", "build_response"},
 		{"build_response", compose.END},
 	}
@@ -389,26 +296,188 @@ func (s *Service) compileGraph(ctx context.Context) (compose.Runnable[RunRequest
 			return nil, err
 		}
 	}
+	if err := g.AddBranch("classify_request", compose.NewGraphBranch(func(ctx context.Context, state workState) (string, error) {
+		if strings.TrimSpace(state.DirectAnswer) != "" {
+			return "direct_answer", nil
+		}
+		return "adk_chat_model_agent", nil
+	}, map[string]bool{"direct_answer": true, "adk_chat_model_agent": true})); err != nil {
+		return nil, err
+	}
 	return g.Compile(ctx, compose.WithGraphName("kkg_agent_graph"), compose.WithMaxRunSteps(20))
 }
 
-func (s *Service) normalize(_ context.Context, req RunRequest) (workState, error) {
+func (s *Service) normalize(ctx context.Context, req RunRequest) (workState, error) {
+	start := time.Now()
+	if strings.EqualFold(strings.TrimSpace(req.ApprovalAction), approvalReplyApprove) || strings.EqualFold(strings.TrimSpace(req.ApprovalAction), approvalReplyReject) {
+		item, ok := s.approvalStore.consume(req.UserID, req.SessionID, strings.TrimSpace(req.ApprovalID))
+		if !ok {
+			return workState{}, fmt.Errorf("approval request expired or invalid")
+		}
+		req.QuestionID = item.QuestionID
+		req.Language = item.Language
+		req.Code = item.Code
+		req.Submit = strings.EqualFold(strings.TrimSpace(req.ApprovalAction), approvalReplyApprove)
+		if req.Submit {
+			req.Query = fmt.Sprintf("确认提交题目 %d 的代码", req.QuestionID)
+		} else {
+			req.Query = fmt.Sprintf("取消提交题目 %d 的代码", req.QuestionID)
+		}
+	}
 	query := strings.TrimSpace(req.Query)
+	if req.SubmissionID <= 0 {
+		req.SubmissionID = extractSubmissionID(query)
+	}
+	if req.QuestionID <= 0 {
+		req.QuestionID = extractQuestionID(query)
+	}
 	if query == "" && req.QuestionID > 0 {
 		query = fmt.Sprintf("为 KKG OJ 题目 %d 生成题解与讲解", req.QuestionID)
 	}
 	if query == "" {
 		return workState{}, fmt.Errorf("query or question_id is required")
 	}
-	return workState{
-		Request:    req,
-		Query:      query,
-		StartedAt:  time.Now(),
-		Normalized: true,
-	}, nil
+	directAnswer := directRestatementAnswer(query)
+	if strings.EqualFold(strings.TrimSpace(req.ApprovalAction), approvalReplyReject) {
+		directAnswer = "已取消本次代码提交。"
+	}
+	state := workState{
+		Request:      req,
+		Query:        query,
+		DirectAnswer: directAnswer,
+		StartedAt:    time.Now(),
+		Normalized:   true,
+	}
+	appendTrace(ctx, &state, ToolTrace{Kind: "stage", Name: "stage.normalize", Status: "ok", Message: "input normalized", DurationMS: time.Since(start).Milliseconds()})
+	return state, nil
+}
+
+func (s *Service) classifyRequest(ctx context.Context, state workState) (workState, error) {
+	start := time.Now()
+	state = resolveContextReferences(state)
+	query := strings.ToLower(state.Query)
+	compactQuery := strings.ReplaceAll(query, " ", "")
+	hints := make([]string, 0, 6)
+	addHint := func(hint string) {
+		for _, existing := range hints {
+			if existing == hint {
+				return
+			}
+		}
+		hints = append(hints, hint)
+	}
+
+	if state.Request.QuestionID > 0 {
+		addHint("explicit_question_id")
+	}
+	if state.Request.SubmissionID > 0 {
+		addHint("explicit_submission_id")
+	}
+	if containsAny(compactQuery, "不使用rag", "不用rag", "不要rag", "禁用rag", "withoutrag", "norag") {
+		addHint("no_rag")
+	}
+	if containsAny(query, "题面", "题目详情", "题目内容", "查看题目", "检索题面", "题目信息") {
+		addHint("question_detail_request")
+	}
+	if strings.TrimSpace(state.Request.Code) != "" {
+		addHint("code_provided")
+	}
+	if containsAny(query, "上面", "上边", "刚才", "之前", "上一", "前面") {
+		addHint("context_reference")
+	}
+	submitConfirmation := isSubmitConfirmation(state.Query) ||
+		isSubmitConfirmationReply(state.Query, state.History) ||
+		strings.EqualFold(strings.TrimSpace(state.Request.ApprovalAction), approvalReplyApprove)
+	judgeIntent := containsAny(query,
+		"提交结果",
+		"提交记录",
+		"查看结果",
+		"查询结果",
+		"最新提交",
+		"刚才提交",
+		"上次提交",
+		"最近提交",
+		"提交#",
+		"判题",
+		"是否通过",
+		"通过了吗",
+		"ac",
+	)
+	submitIntent := state.Request.Submit || (!judgeIntent && containsAny(query, "提交", "submit")) || submitConfirmation
+	submitConfirmed := submitIntent && submitConfirmation
+	if submitIntent || judgeIntent {
+		addHint("submit_or_judge_request")
+	}
+	if containsAny(query, "运行", "run", "执行", "测试") && strings.TrimSpace(state.Request.Code) != "" {
+		addHint("code_run_request")
+	}
+	if containsAny(query, "推荐", "找题", "相似题", "专项", "练习", "知识点", "题单") {
+		addHint("question_recommendation")
+	}
+	if containsAny(query, "博客", "文章", "题解", "评论", "blog") {
+		addHint("blog_or_solution_material")
+	}
+	if containsAny(query, "登录", "鉴权", "接口", "部署", "容器", "项目结构", "api", "docker") {
+		addHint("platform_or_project_question")
+	}
+	if strings.TrimSpace(state.DirectAnswer) != "" {
+		addHint("direct_restatement")
+	}
+
+	loggedIn := strings.TrimSpace(state.Request.AccessToken) != ""
+	state.IntentHints = hints
+	state.SubmitConfirmed = submitConfirmed
+	questionIDStatus := "missing"
+	if state.Request.QuestionID > 0 {
+		questionIDStatus = "known"
+	}
+	codeStatus := "missing"
+	if strings.TrimSpace(state.Request.Code) != "" {
+		codeStatus = "provided"
+	}
+	submitMissing := make([]string, 0, 3)
+	if !loggedIn {
+		submitMissing = append(submitMissing, "login")
+	}
+	if state.Request.QuestionID <= 0 {
+		submitMissing = append(submitMissing, "question_id")
+	}
+	if strings.TrimSpace(state.Request.Code) == "" {
+		submitMissing = append(submitMissing, "code")
+	}
+	submitReady := len(submitMissing) == 0
+	state.ToolPolicy = map[string]any{
+		"logged_in":                    loggedIn,
+		"question_id_status":           questionIDStatus,
+		"submission_id_status":         submissionIDStatus(state.Request.SubmissionID),
+		"code_status":                  codeStatus,
+		"submit_intent":                submitIntent,
+		"judge_intent":                 judgeIntent,
+		"submit_ready":                 submitReady,
+		"submit_missing":               submitMissing,
+		"submit_confirmed":             submitConfirmed,
+		"requires_submit_confirmation": submitIntent && submitReady && !submitConfirmed,
+		"disable_rag":                  containsString(hints, "no_rag"),
+		"prefer_rag_for_listing":       containsString(hints, "question_recommendation"),
+		"guidance":                     "题目查询、题解、运行和提交结果查询可在题号/上下文确定时执行；只有正式提交代码需要用户明确确认。",
+	}
+	appendTrace(ctx, &state, ToolTrace{
+		Kind:       "stage",
+		Name:       "stage.classify_request",
+		Status:     "ok",
+		Message:    strings.Join(hints, ", "),
+		DurationMS: time.Since(start).Milliseconds(),
+		Metadata: map[string]any{
+			"intent_hints": hints,
+			"tool_policy":  state.ToolPolicy,
+		},
+	})
+	rebuildRuntimeMessages(&state)
+	return state, nil
 }
 
 func (s *Service) prepareSession(ctx context.Context, state workState) (workState, error) {
+	start := time.Now()
 	sessionID := strings.TrimSpace(state.Request.SessionID)
 	if sessionID == "" {
 		sessionID = newSessionID()
@@ -425,74 +494,162 @@ func (s *Service) prepareSession(ctx context.Context, state workState) (workStat
 		return state, err
 	}
 	history = sanitizeHistory(history, 12)
-	userPrompt := agentUserPrompt(state)
 	messages := make([]*schema.Message, 0, len(history)+1)
 	messages = append(messages, history...)
 	persistedUserMessage := schema.UserMessage(state.Query)
-	runtimeUserMessage := schema.UserMessage(userPrompt)
-	messages = append(messages, runtimeUserMessage)
 	state.History = history
 	state.Messages = messages
 	state.TurnMessages = []*schema.Message{persistedUserMessage}
+	appendTrace(ctx, &state, ToolTrace{
+		Kind:       "stage",
+		Name:       "stage.prepare_session",
+		Status:     "ok",
+		Message:    fmt.Sprintf("history=%d", len(history)),
+		DurationMS: time.Since(start).Milliseconds(),
+		Metadata: map[string]any{
+			"session_id": sessionID,
+			"history":    len(history),
+		},
+	})
+	return state, nil
+}
+
+func (s *Service) directAnswer(ctx context.Context, state workState) (workState, error) {
+	start := time.Now()
+	state.FinalAnswer = strings.TrimSpace(state.DirectAnswer)
+	if state.FinalAnswer == "" {
+		return state, fmt.Errorf("direct answer is empty")
+	}
+	state.TurnMessages = append(state.TurnMessages, schema.AssistantMessage(state.FinalAnswer, nil))
+	appendTrace(ctx, &state, ToolTrace{
+		Kind:       "stage",
+		Name:       "stage.direct_answer",
+		Status:     "ok",
+		Message:    "answered without model for exact restatement request",
+		DurationMS: time.Since(start).Milliseconds(),
+	})
 	return state, nil
 }
 
 func (s *Service) executeRouterAgent(ctx context.Context, state workState) (workState, error) {
-	iter := s.runner.Run(ctx, state.Messages,
-		adk.WithCheckPointID(state.SessionID),
-		adk.WithSessionValues(map[string]any{
-			kkgtools.SessionKeyAccessToken: state.Request.AccessToken,
-			kkgtools.SessionKeyUserID:      state.Request.UserID,
-			kkgtools.SessionKeyRequestID:   state.Request.RequestID,
-		}),
-	)
-
-	var final *schema.Message
-	for {
-		event, ok := iter.Next()
-		if !ok {
-			break
-		}
-		if event == nil {
-			continue
-		}
-		if event.Err != nil {
-			state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "eino.adk.runner", Status: "error", Message: event.Err.Error()})
-			return state, event.Err
-		}
-		if event.Output == nil || event.Output.MessageOutput == nil {
-			continue
-		}
-		isRootEvent := isRouterAgentEvent(event)
-		msg, streamed, err := collectADKMessage(ctx, event.Output.MessageOutput, isRootEvent)
-		if err != nil {
-			state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "eino.adk.message", Status: "error", Message: err.Error()})
-			continue
-		}
-		if isRootEvent && streamed {
-			state.StreamedAnswer = true
-		}
-		if msg != nil && isRootEvent {
-			state.TurnMessages = append(state.TurnMessages, msg)
-		}
-		s.recordADKMessage(ctx, &state, msg, event.Output.MessageOutput)
-		if isRootEvent && msg != nil && msg.Role == schema.Assistant && strings.TrimSpace(msg.Content) != "" {
-			final = msg
-		}
+	start := time.Now()
+	if state.PendingApproval != nil {
+		return state, nil
+	}
+	if strings.TrimSpace(state.DirectAnswer) != "" {
+		state.FinalAnswer = state.DirectAnswer
+		state.TurnMessages = append(state.TurnMessages, schema.AssistantMessage(state.FinalAnswer, nil))
+		appendTrace(ctx, &state, ToolTrace{
+			Kind:       "stage",
+			Name:       "stage.direct_restatement",
+			Status:     "ok",
+			Message:    "answered without model for exact restatement request",
+			DurationMS: time.Since(start).Milliseconds(),
+		})
+		return state, nil
 	}
 
+	runOnce := func() (*schema.Message, error) {
+		iter := s.runner.Run(ctx, state.Messages,
+			adk.WithCheckPointID(state.SessionID),
+			adk.WithSessionValues(map[string]any{
+				kkgtools.SessionKeyAccessToken:     state.Request.AccessToken,
+				kkgtools.SessionKeyUserID:          state.Request.UserID,
+				kkgtools.SessionKeyRequestID:       state.Request.RequestID,
+				kkgtools.SessionKeySubmitConfirmed: state.SubmitConfirmed,
+			}),
+		)
+
+		var final *schema.Message
+		for {
+			event, ok := iter.Next()
+			if !ok {
+				break
+			}
+			if event == nil {
+				continue
+			}
+			if event.Err != nil {
+				appendTrace(ctx, &state, ToolTrace{Kind: "stage", Name: "eino.adk.runner", Status: "error", Message: event.Err.Error(), DurationMS: time.Since(start).Milliseconds()})
+				return nil, event.Err
+			}
+			if event.Output == nil || event.Output.MessageOutput == nil {
+				continue
+			}
+			isRootEvent := isRouterAgentEvent(event)
+			msg, streamed, usage, err := collectADKMessage(ctx, event.Output.MessageOutput, false)
+			if err != nil {
+				appendTrace(ctx, &state, ToolTrace{Kind: "stage", Name: "eino.adk.message", Status: "error", Message: err.Error()})
+				continue
+			}
+			collectMessageUsage(ctx, &state, msg, usage)
+			if isRootEvent && streamed {
+				state.StreamedAnswer = true
+			}
+			if msg != nil && isRootEvent {
+				state.TurnMessages = append(state.TurnMessages, msg)
+			}
+			s.recordADKMessage(ctx, &state, msg, event.Output.MessageOutput)
+			if state.PendingApproval != nil {
+				approvalMessage := schema.AssistantMessage(state.FinalAnswer, nil)
+				state.TurnMessages = append(state.TurnMessages, approvalMessage)
+				return approvalMessage, nil
+			}
+			if isRootEvent && msg != nil && msg.Role == schema.Assistant && strings.TrimSpace(msg.Content) != "" {
+				final = msg
+			}
+		}
+		return final, nil
+	}
+
+	final, err := runOnce()
+	if err != nil {
+		return state, err
+	}
 	if final == nil || strings.TrimSpace(final.Content) == "" {
 		return state, fmt.Errorf("eino adk agent returned no final answer")
 	}
 	state.FinalAnswer = strings.TrimSpace(final.Content)
-	state.ToolTrace = append(state.ToolTrace, ToolTrace{Name: "eino.adk.router_agent", Status: "ok", Message: "ReAct loop completed"})
+	appendTrace(ctx, &state, ToolTrace{Kind: "stage", Name: "eino.adk.router_agent", Status: "ok", Message: "ReAct loop completed", DurationMS: time.Since(start).Milliseconds()})
+	return state, nil
+}
+
+func (s *Service) postprocessAnswer(ctx context.Context, state workState) (workState, error) {
+	start := time.Now()
+	original := state.FinalAnswer
+	state.FinalAnswer = normalizeKKGCodeProtocol(state.FinalAnswer)
+	if state.FinalAnswer != original {
+		replaceLastAssistantMessage(state.TurnMessages, state.FinalAnswer)
+		appendTrace(ctx, &state, ToolTrace{
+			Kind:       "stage",
+			Name:       "stage.postprocess_answer",
+			Status:     "ok",
+			Message:    "normalized code rendering protocol",
+			DurationMS: time.Since(start).Milliseconds(),
+		})
+		return state, nil
+	}
+	appendTrace(ctx, &state, ToolTrace{
+		Kind:       "stage",
+		Name:       "stage.postprocess_answer",
+		Status:     "ok",
+		Message:    "no changes",
+		DurationMS: time.Since(start).Milliseconds(),
+	})
 	return state, nil
 }
 
 func (s *Service) persistSession(ctx context.Context, state workState) (workState, error) {
-	if err := s.memory.AppendMessages(ctx, state.Request.UserID, state.SessionID, state.TurnMessages...); err != nil {
+	start := time.Now()
+	messages := state.TurnMessages
+	if state.PendingApproval != nil {
+		messages = approvalSafeMessages(state.TurnMessages, state.FinalAnswer)
+	}
+	if err := s.memory.AppendMessages(ctx, state.Request.UserID, state.SessionID, messages...); err != nil {
+		appendTrace(ctx, &state, ToolTrace{Kind: "stage", Name: "stage.persist_session", Status: "error", Message: err.Error(), DurationMS: time.Since(start).Milliseconds()})
 		return state, err
 	}
+	appendTrace(ctx, &state, ToolTrace{Kind: "stage", Name: "stage.persist_session", Status: "ok", Message: fmt.Sprintf("messages=%d", len(messages)), DurationMS: time.Since(start).Milliseconds()})
 	return state, nil
 }
 
@@ -501,19 +658,30 @@ func (s *Service) buildResponse(ctx context.Context, state workState) (RunRespon
 	if mode == "" {
 		mode = ModeGraph
 	}
+	toolTrace := mergeToolTraces(state.ToolTrace, callbackTracesFromContext(ctx))
 	out := RunResponse{
 		Mode:        mode,
 		SessionID:   state.SessionID,
 		Answer:      state.FinalAnswer,
 		RAGDocs:     state.RAGDocs,
-		ToolTrace:   state.ToolTrace,
+		ToolTrace:   toolTrace,
 		ToolResults: state.ToolResults,
+		TokenUsage:  state.TokenUsage,
+		ModelCalls:  state.ModelCalls,
 		LatencyMS:   time.Since(state.StartedAt).Milliseconds(),
 		RequestID:   state.Request.RequestID,
 	}
 	if !state.StreamedAnswer {
 		emitAnswerDeltas(ctx, state.FinalAnswer)
 	}
+	emitStreamEvent(ctx, StreamEvent{
+		Type: "metrics",
+		Metrics: &RunMetrics{
+			TokenUsage: state.TokenUsage,
+			ModelCalls: state.ModelCalls,
+			LatencyMS:  out.LatencyMS,
+		},
+	})
 	emitStreamEvent(ctx, StreamEvent{Type: "done", SessionID: state.SessionID, Done: &out})
 	return out, nil
 }
@@ -531,9 +699,8 @@ func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *s
 		for _, call := range msg.ToolCalls {
 			names = append(names, call.Function.Name)
 		}
-		trace := ToolTrace{Name: "eino.adk.model_tool_calls", Status: "ok", Message: strings.Join(names, ", ")}
-		state.ToolTrace = append(state.ToolTrace, trace)
-		emitStreamEvent(ctx, StreamEvent{Type: "trace", Trace: &trace})
+		trace := ToolTrace{Kind: "model", Name: "eino.adk.model_tool_calls", Status: "ok", Message: strings.Join(names, ", ")}
+		appendTrace(ctx, state, trace)
 	case schema.Tool:
 		name := msg.ToolName
 		if name == "" && variant != nil {
@@ -547,32 +714,32 @@ func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *s
 			if summary == "" {
 				summary = "agent completed"
 			}
-			trace := ToolTrace{Name: name, Status: "ok", Message: summary}
+			trace := ToolTrace{Kind: "tool", Name: name, Status: "ok", Message: summary}
 			result := ToolResult{Name: name, Status: "ok", Summary: summary, Data: extractDisplayContent(msg)}
-			state.ToolTrace = append(state.ToolTrace, trace)
 			state.ToolResults = append(state.ToolResults, result)
 			emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
+			appendTrace(ctx, state, trace)
 			return
 		}
 		payload, err := decodeToolPayload(msg)
 		if err != nil {
 			if isKKGToolName(name) {
-				trace := ToolTrace{Name: name, Status: "error", Message: err.Error()}
+				trace := ToolTrace{Kind: "tool", Name: name, Status: "error", Message: err.Error()}
 				result := ToolResult{Name: name, Status: "error", Summary: err.Error(), Data: extractDisplayContent(msg)}
-				state.ToolTrace = append(state.ToolTrace, trace)
 				state.ToolResults = append(state.ToolResults, result)
 				emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
+				appendTrace(ctx, state, trace)
 				return
 			}
 			summary := compactText(extractDisplayContent(msg), 120)
 			if summary == "" {
 				summary = err.Error()
 			}
-			trace := ToolTrace{Name: name, Status: "ok", Message: summary}
+			trace := ToolTrace{Kind: "tool", Name: name, Status: "ok", Message: summary}
 			result := ToolResult{Name: name, Status: "ok", Summary: summary, Data: extractDisplayContent(msg)}
-			state.ToolTrace = append(state.ToolTrace, trace)
 			state.ToolResults = append(state.ToolResults, result)
 			emitStreamEvent(ctx, StreamEvent{Type: "tool_result", Trace: &trace, Result: &result})
+			appendTrace(ctx, state, trace)
 			return
 		}
 		status := "ok"
@@ -583,7 +750,7 @@ func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *s
 		if summary == "" {
 			summary = "completed"
 		}
-		trace := ToolTrace{Name: name, Status: status, Message: summary}
+		trace := ToolTrace{Kind: "tool", Name: name, Status: status, Message: summary}
 		result := ToolResult{
 			Name:    name,
 			Status:  status,
@@ -591,8 +758,17 @@ func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *s
 			Data:    payload.Data,
 			Error:   payload.Error,
 		}
-		state.ToolTrace = append(state.ToolTrace, trace)
 		state.ToolResults = append(state.ToolResults, result)
+		appendTrace(ctx, state, trace)
+		if approval := s.approvalFromToolPayload(state, name, payload); approval != nil {
+			state.PendingApproval = approval
+			state.FinalAnswer = "本次代码提交需要你的确认。请使用下方的确认或取消操作继续。"
+			emitStreamEvent(ctx, StreamEvent{
+				Type:      "approval_required",
+				SessionID: state.SessionID,
+				Approval:  approval,
+			})
+		}
 		if isRAGToolName(name) && status == "ok" {
 			docs := decodeRAGDocuments(payload.Data)
 			state.RAGDocs = docs
@@ -606,20 +782,21 @@ func (s *Service) recordADKMessage(ctx context.Context, state *workState, msg *s
 	}
 }
 
-func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAssistantChunks bool) (*schema.Message, bool, error) {
+func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAssistantChunks bool) (*schema.Message, bool, TokenUsage, error) {
 	if variant == nil {
-		return nil, false, nil
+		return nil, false, TokenUsage{}, nil
 	}
 	if !variant.IsStreaming {
 		msg, err := variant.GetMessage()
-		return msg, false, err
+		return msg, false, TokenUsage{}, err
 	}
 	if variant.MessageStream == nil {
-		return nil, false, fmt.Errorf("streaming message output is missing stream")
+		return nil, false, TokenUsage{}, fmt.Errorf("streaming message output is missing stream")
 	}
 	defer variant.MessageStream.Close()
 
 	var chunks []*schema.Message
+	var usage TokenUsage
 	streamed := false
 	for {
 		chunk, err := variant.MessageStream.Recv()
@@ -627,11 +804,12 @@ func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAss
 			break
 		}
 		if err != nil {
-			return nil, streamed, err
+			return nil, streamed, usage, err
 		}
 		if chunk == nil {
 			continue
 		}
+		usage.add(tokenUsageFromMessage(chunk))
 		chunks = append(chunks, chunk)
 		if emitAssistantChunks && variant.Role == schema.Assistant && strings.TrimSpace(chunk.Content) != "" {
 			emitStreamEvent(ctx, StreamEvent{Type: "message", Message: chunk.Content})
@@ -639,10 +817,10 @@ func collectADKMessage(ctx context.Context, variant *adk.MessageVariant, emitAss
 		}
 	}
 	if len(chunks) == 0 {
-		return nil, streamed, nil
+		return nil, streamed, usage, nil
 	}
 	msg, err := schema.ConcatMessages(chunks)
-	return msg, streamed, err
+	return msg, streamed, usage, err
 }
 
 func isRouterAgentEvent(event *adk.AgentEvent) bool {
@@ -673,80 +851,6 @@ func isKKGToolName(name string) bool {
 
 func isRAGToolName(name string) bool {
 	return name == "kkg_rag_search_questions"
-}
-
-func (s *Service) ListSessions(ctx context.Context, userID int64, archived bool) ([]ConversationSession, error) {
-	items, err := s.memory.ListSessions(ctx, userID, 50, archived)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ConversationSession, 0, len(items))
-	for _, item := range items {
-		out = append(out, ConversationSession{
-			ID:           item.ID,
-			Title:        item.Title,
-			LastMessage:  item.LastMessage,
-			MessageCount: item.MessageCount,
-			LastActiveAt: item.LastActiveAt,
-			Archived:     item.Archived,
-		})
-	}
-	return out, nil
-}
-
-func (s *Service) LoadSession(ctx context.Context, userID int64, sessionID string) (ConversationSession, error) {
-	history, err := s.memory.LoadSession(ctx, userID, sessionID)
-	if err != nil {
-		return ConversationSession{}, err
-	}
-	summary := memory.SessionSummary{ID: sessionID}
-	for _, archived := range []bool{false, true} {
-		items, err := s.memory.ListSessions(ctx, userID, 200, archived)
-		if err != nil {
-			continue
-		}
-		for _, item := range items {
-			if item.ID == sessionID {
-				summary = item
-				break
-			}
-		}
-		if summary.Title != "" || summary.LastMessage != "" || summary.Archived {
-			break
-		}
-	}
-	session := ConversationSession{
-		ID:           sessionID,
-		Title:        summary.Title,
-		LastMessage:  summary.LastMessage,
-		MessageCount: len(history),
-		LastActiveAt: summary.LastActiveAt,
-		Archived:     summary.Archived,
-		Messages:     make([]ConversationMessage, 0),
-	}
-	for _, msg := range history {
-		if msg == nil {
-			continue
-		}
-		switch msg.Role {
-		case schema.User:
-			session.Messages = append(session.Messages, ConversationMessage{Role: "user", Content: extractDisplayContent(msg)})
-		case schema.Assistant:
-			if strings.TrimSpace(msg.Content) == "" {
-				continue
-			}
-			session.Messages = append(session.Messages, ConversationMessage{Role: "assistant", Content: extractDisplayContent(msg)})
-		}
-	}
-	return session, nil
-}
-
-func (s *Service) ArchiveSession(ctx context.Context, userID int64, sessionID string, archived bool) error {
-	return s.memory.ArchiveSession(ctx, userID, sessionID, archived)
-}
-
-func (s *Service) DeleteSession(ctx context.Context, userID int64, sessionID string) error {
-	return s.memory.DeleteSession(ctx, userID, sessionID)
 }
 
 func decodeToolPayload(msg *schema.Message) (*kkgtools.ResultPayload, error) {
@@ -789,263 +893,103 @@ func decodeRAGDocuments(data any) []rag.Document {
 	return docs
 }
 
-type streamEmitterKey struct{}
-
-func emitStreamEvent(ctx context.Context, event StreamEvent) {
-	if ctx == nil {
-		return
-	}
-	emit, ok := ctx.Value(streamEmitterKey{}).(func(StreamEvent) error)
-	if !ok || emit == nil {
-		return
-	}
-	_ = emit(event)
-}
-
-func emitAnswerDeltas(ctx context.Context, answer string) {
-	text := strings.TrimSpace(answer)
-	if text == "" {
-		return
-	}
-	runes := []rune(text)
-	const chunkSize = 10
-	for start := 0; start < len(runes); start += chunkSize {
-		end := start + chunkSize
-		if end > len(runes) {
-			end = len(runes)
-		}
-		emitStreamEvent(ctx, StreamEvent{Type: "message", Message: string(runes[start:end])})
-		if end < len(runes) {
-			time.Sleep(18 * time.Millisecond)
-		}
-	}
-}
-
-func extractDisplayContent(msg *schema.Message) string {
-	if msg == nil {
-		return ""
-	}
-	text := strings.TrimSpace(msg.Content)
-	if text == "" && len(msg.UserInputMultiContent) > 0 {
-		for _, part := range msg.UserInputMultiContent {
-			if part.Type == schema.ChatMessagePartTypeText && strings.TrimSpace(part.Text) != "" {
-				text = strings.TrimSpace(part.Text)
-				break
-			}
-		}
-	}
-	if text == "" {
-		return ""
-	}
-	var payload map[string]any
-	if json.Unmarshal([]byte(text), &payload) == nil {
-		if userQuery, ok := payload["user_query"].(string); ok && strings.TrimSpace(userQuery) != "" {
-			return strings.TrimSpace(userQuery)
-		}
-	}
-	return text
-}
-
-func sanitizeHistory(history []*schema.Message, limit int) []*schema.Message {
-	if len(history) == 0 {
+func (s *Service) approvalFromToolPayload(state *workState, toolName string, payload *kkgtools.ResultPayload) *ApprovalRequest {
+	if state == nil || payload == nil {
 		return nil
 	}
-	start := 0
-	if limit > 0 && len(history) > limit {
-		start = len(history) - limit
-	}
-	window := cloneHistoryMessages(history[start:])
-	for len(window) > 0 {
-		msg := window[0]
-		if msg == nil {
-			window = window[1:]
-			continue
-		}
-		if msg.Role != schema.Tool {
-			break
-		}
-		window = window[1:]
-	}
-
-	out := make([]*schema.Message, 0, len(window))
-	pendingToolCalls := make(map[string]struct{})
-	for _, msg := range window {
-		if msg == nil {
-			continue
-		}
-		switch msg.Role {
-		case schema.Assistant:
-			if len(msg.ToolCalls) > 0 {
-				for _, call := range msg.ToolCalls {
-					if strings.TrimSpace(call.ID) != "" {
-						pendingToolCalls[call.ID] = struct{}{}
-					}
-				}
-			}
-			out = append(out, msg)
-		case schema.Tool:
-			if strings.TrimSpace(msg.ToolCallID) == "" {
-				continue
-			}
-			if _, ok := pendingToolCalls[msg.ToolCallID]; !ok {
-				continue
-			}
-			delete(pendingToolCalls, msg.ToolCallID)
-			out = append(out, msg)
-		default:
-			out = append(out, msg)
-		}
-	}
-	return out
-}
-
-func cloneHistoryMessages(messages []*schema.Message) []*schema.Message {
-	if len(messages) == 0 {
+	if toolName != "kkg_oj_submit_solution" || !toolPayloadNeedsApproval(payload) {
 		return nil
 	}
-	out := make([]*schema.Message, 0, len(messages))
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-		raw, err := json.Marshal(msg)
-		if err != nil {
-			continue
-		}
-		var copied schema.Message
-		if err := json.Unmarshal(raw, &copied); err != nil {
-			continue
-		}
-		out = append(out, &copied)
+	code := strings.TrimSpace(state.Request.Code)
+	questionID, language, codeChars, codeLines := approvalDetailsFromToolData(payload.Data, state.Request.QuestionID, state.Request.Language, code)
+	item := storedApproval{
+		ApprovalRequest: ApprovalRequest{
+			ID:          newApprovalID(),
+			Action:      approvalActionSubmit,
+			Title:       "确认提交代码",
+			Message:     fmt.Sprintf("准备提交题目 %d 的 %s 代码。确认后将正式提交到 KKG OJ。", questionID, approvalLanguage(language)),
+			SessionID:   state.SessionID,
+			QuestionID:  questionID,
+			Language:    normalizeApprovalLanguage(language),
+			CodeChars:   codeChars,
+			CodeLines:   codeLines,
+			RequestedAt: time.Now().Format(time.RFC3339),
+		},
+		UserID:    state.Request.UserID,
+		Code:      code,
+		CreatedAt: time.Now(),
 	}
-	return out
+	approval := s.approvalStore.save(item)
+	return &approval
 }
 
-func generalAgentInstruction() string {
-	return strings.Join([]string{
-		"你是 KKG Agent 的通用智能体。",
-		"你处理普通问答、平台说明、工程讨论、系统能力说明和非 OJ 题目请求。",
-		"你没有工具可用，因此只能基于当前消息和已知上下文直接回答。",
-		"回答必须中文、简洁、明确；不知道的内容直接说明，不要虚构题目、博客、提交记录或平台数据。",
-	}, "\n")
-}
-
-func routerAgentInstruction() string {
-	return strings.Join([]string{
-		"你是 KKG Agent 的顶层路由智能体。",
-		"你必须先判断当前请求是否需要委派给专业子智能体；只有在需要专业领域能力时才调用子智能体工具。",
-		"可用能力包括：题库 RAG 检索工具、KKG 平台说明子智能体、KKG 博客知识子智能体、KKG OJ 题目讲解与提交分析子智能体。",
-		"当用户请求题目推荐、找题、专项练习、相似题、按知识点寻找练习材料，或需要题库候选材料时，由你调用 kkg_rag_search_questions；不要依赖业务层预先提供 rag_docs。",
-		"调用 RAG 工具后，直接基于返回的文档给出推荐或候选说明；只有用户选定具体题目并要求题解、题面详情、代码运行或提交分析时，才委派 KKG OJ 题目子智能体。",
-		"调用子智能体工具时，必须严格按工具参数 schema 传参，确保 request 自包含，必要时带上 question_id、code、language、input、submit 等字段。",
-		"如果用户只是普通聊天、一般工程问题、泛化解释，直接回答，不要强行调用子智能体。",
-		"如果用户的问题同时涉及多个子领域，可以按需要顺序调用多个子智能体，再综合回答。",
-		"回答必须中文、简洁、明确；不要编造平台数据、博客内容、题目条件或提交结果。",
-	}, "\n")
-}
-
-func platformAgentInstruction() string {
-	return strings.Join([]string{
-		"你是 KKG 平台与项目说明智能体。",
-		"你的输入来自父智能体调用工具时传入的结构化参数，其中 request 字段是你必须直接处理的自包含请求。",
-		"你负责回答 KKG 平台能力、登录鉴权、接口边界、项目结构、开发容器、部署方式和系统说明相关问题。",
-		"你没有实时工具，不要假装读取了线上状态或不存在的数据。",
-		"回答必须中文、清晰、工程化，优先说明边界、依赖、前提条件和限制。",
-	}, "\n")
-}
-
-func blogAgentInstruction() string {
-	return strings.Join([]string{
-		"你是 KKG 博客与知识材料智能体。",
-		"你的输入来自父智能体调用工具时传入的结构化参数，其中 request 字段是你必须直接处理的自包含请求。",
-		"你负责查找博客文章、相关文章、评论和知识材料摘要。",
-		"优先使用博客工具获取文章、搜索结果和评论，不要编造文章标题、正文或评论。",
-		"回答必须中文 Markdown，简洁说明：相关材料、摘要、可继续阅读的文章或缺失信息。",
-	}, "\n")
-}
-
-func questionAgentInstruction() string {
-	return strings.Join([]string{
-		"你是 KKG OJ 的题目讲解子智能体，只处理题目讲解、题解、相关博客、代码运行和提交验证。",
-		"你的输入来自父智能体调用工具时传入的结构化参数，request 字段描述任务本身；question_id、code、language、input、submit 等字段会按需提供。",
-		"题目推荐、找题、专项练习或相似题通常应由父智能体先使用 RAG 工具处理；你不要逐个调用 kkg_oj_get_question 批量拉取详情。",
-		"只有用户明确指定某个 question_id 并要求讲解、题面详情、运行或提交时，才调用 kkg_oj_get_question。",
-		"如果确实需要浏览题库，kkg_oj_list_questions 最多调用一次用于发现候选题；不要循环翻页或连续查多个题目详情。",
-		"用户询问题目做法时，优先根据题目 ID 调用 KKG OJ 工具获取题面；需要相关资料时调用博客或题解工具。",
-		"不要编造不存在的题目条件、博客、提交结果或工具返回。",
-		"如果用户提供代码并要求运行或提交，只有在已登录且题目 ID 明确时才调用运行或提交工具。",
-		"输出中文 Markdown，结构包含：题目理解、知识点、做法讲解、复杂度、相关博客、下一步建议。",
-	}, "\n")
-}
-
-func agentUserPrompt(state workState) string {
-	payload := map[string]any{
-		"user_query":  state.Query,
-		"question_id": state.Request.QuestionID,
-		"language":    state.Request.Language,
-		"code":        state.Request.Code,
-		"input":       state.Request.Input,
-		"submit":      state.Request.Submit,
+func toolPayloadNeedsApproval(payload *kkgtools.ResultPayload) bool {
+	if payload == nil {
+		return false
 	}
-	raw, _ := json.MarshalIndent(payload, "", "  ")
-	return strings.Join([]string{
-		"以下是当前会话请求的结构化上下文。",
-		"请根据当前智能体的职责回答，不要越权假装具备其他能力。",
-		"",
-		"```json",
-		string(raw),
-		"```",
-	}, "\n")
+	if payload.Error != nil && payload.Error.Type == "approval_required" {
+		return true
+	}
+	record, ok := payload.Data.(map[string]any)
+	if !ok {
+		return false
+	}
+	switch value := record["approval_required"].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	default:
+		return false
+	}
 }
 
-func platformAgentInputSchema() *schema.ParamsOneOf {
-	return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
-		"request": {
-			Desc:     "需要 KKG 平台说明子智能体处理的自包含请求，应该包含用户真正关心的平台/接口/登录/容器/部署问题。",
-			Required: true,
-			Type:     schema.String,
-		},
-	})
+func approvalDetailsFromToolData(data any, fallbackQuestionID int64, fallbackLanguage, fallbackCode string) (int64, string, int, int) {
+	questionID := fallbackQuestionID
+	language := normalizeApprovalLanguage(fallbackLanguage)
+	codeChars := len([]rune(strings.TrimSpace(fallbackCode)))
+	codeLines := countCodeLines(fallbackCode)
+	record, ok := data.(map[string]any)
+	if !ok {
+		return questionID, language, codeChars, codeLines
+	}
+	if value, ok := int64FromAny(record["question_id"]); ok && value > 0 {
+		questionID = value
+	}
+	if value := strings.TrimSpace(fmt.Sprint(record["language"])); value != "" && value != "<nil>" {
+		language = value
+	}
+	if value, ok := intFromAny(record["code_chars"]); ok && value >= 0 {
+		codeChars = value
+	}
+	if value, ok := intFromAny(record["code_lines"]); ok && value >= 0 {
+		codeLines = value
+	}
+	return questionID, language, codeChars, codeLines
 }
 
-func blogAgentInputSchema() *schema.ParamsOneOf {
-	return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
-		"request": {
-			Desc:     "需要 KKG 博客子智能体处理的自包含请求，应该包含要查找的博客主题、文章方向或评论上下文。",
-			Required: true,
-			Type:     schema.String,
-		},
-	})
+func int64FromAny(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	case json.Number:
+		n, err := v.Int64()
+		return n, err == nil
+	default:
+		return 0, false
+	}
 }
 
-func questionAgentInputSchema() *schema.ParamsOneOf {
-	return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
-		"request": {
-			Desc:     "需要 KKG OJ 题目子智能体处理的自包含请求，应描述题目讲解、提交结果分析、运行代码或题解查找任务。",
-			Required: true,
-			Type:     schema.String,
-		},
-		"question_id": {
-			Desc: "可选，OJ 题目 ID。",
-			Type: schema.Integer,
-		},
-		"language": {
-			Desc: "可选，代码语言。",
-			Type: schema.String,
-		},
-		"code": {
-			Desc: "可选，待运行或待提交的代码。",
-			Type: schema.String,
-		},
-		"input": {
-			Desc: "可选，运行代码时的标准输入。",
-			Type: schema.String,
-		},
-		"submit": {
-			Desc: "可选，是否偏向正式提交与提交结果分析。",
-			Type: schema.Boolean,
-		},
-	})
+func intFromAny(value any) (int, bool) {
+	v, ok := int64FromAny(value)
+	if !ok {
+		return 0, false
+	}
+	return int(v), true
 }
 
 func compactText(value string, limit int) string {
@@ -1055,10 +999,6 @@ func compactText(value string, limit int) string {
 	}
 	runes := []rune(value)
 	return string(runes[:limit]) + "..."
-}
-
-func newSessionID() string {
-	return fmt.Sprintf("sess_%d", time.Now().UnixNano())
 }
 
 func splitToolsByIntent(ctx context.Context, tools []einotool.BaseTool) ([]einotool.BaseTool, []einotool.BaseTool, error) {
@@ -1077,4 +1017,272 @@ func splitToolsByIntent(ctx context.Context, tools []einotool.BaseTool) ([]einot
 		}
 	}
 	return blogTools, questionTools, nil
+}
+
+func containsAny(text string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(text, strings.ToLower(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeApprovalLanguage(language string) string {
+	language = strings.TrimSpace(language)
+	if language == "" {
+		return "go"
+	}
+	return language
+}
+
+func approvalLanguage(language string) string {
+	return strings.ToUpper(normalizeApprovalLanguage(language))
+}
+
+func countCodeLines(code string) int {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return 0
+	}
+	return strings.Count(code, "\n") + 1
+}
+
+func approvalSafeMessages(messages []*schema.Message, finalAnswer string) []*schema.Message {
+	out := make([]*schema.Message, 0, 2)
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if msg.Role == schema.User {
+			out = append(out, msg)
+		}
+	}
+	answer := strings.TrimSpace(finalAnswer)
+	if answer != "" {
+		out = append(out, schema.AssistantMessage(answer, nil))
+	}
+	return out
+}
+
+func isSubmitConfirmation(query string) bool {
+	compact := strings.ToLower(strings.TrimSpace(query))
+	compact = strings.NewReplacer(" ", "", "\n", "", "\t", "", "，", ",", "。", ".", "！", "!", "？", "?").Replace(compact)
+	if compact == "" {
+		return false
+	}
+	return containsAny(compact,
+		"确认提交",
+		"同意提交",
+		"可以提交",
+		"提交吧",
+		"确认submit",
+		"confirm_submit",
+		"yes_submit",
+	)
+}
+
+func isSubmitConfirmationReply(query string, history []*schema.Message) bool {
+	compact := strings.ToLower(strings.TrimSpace(query))
+	compact = strings.NewReplacer(" ", "", "\n", "", "\t", "", "，", ",", "。", ".", "！", "!", "？", "?").Replace(compact)
+	if !containsAny(compact, "确认", "可以", "是的", "对", "同意", "yes", "ok") {
+		return false
+	}
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i] == nil || history[i].Role != schema.Assistant {
+			continue
+		}
+		content := strings.ToLower(extractDisplayContent(history[i]))
+		return containsAny(content, "确认提交", "是否确认提交", "确认后", "回复“确认提交”", "回复\"确认提交\"")
+	}
+	return false
+}
+
+var questionIDPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(?:题目|题号|oj)\s*#?\s*(\d{1,9})`),
+	regexp.MustCompile(`(?i)(?:题目|题号|oj)\s*(?:id|编号)\s*[:：#]?\s*(\d{1,9})`),
+	regexp.MustCompile(`(?i)(\d{1,9})\s*(?:题|题目)`),
+}
+
+var submissionIDPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(?:submission[_\s-]*id|submit[_\s-]*id)\s*[:=]?\s*(\d{1,9})`),
+	regexp.MustCompile(`(?i)(?:提交记录|提交|判题记录)\s*(?:id|编号|#)?\s*[:：]?\s*(\d{1,9})`),
+	regexp.MustCompile(`(?i)(\d{1,9})\s*(?:号)?提交(?:记录)?`),
+}
+
+var looseNumberPattern = regexp.MustCompile(`\d{1,9}`)
+
+func extractSubmissionID(query string) int64 {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return 0
+	}
+	for _, pattern := range submissionIDPatterns {
+		match := pattern.FindStringSubmatch(query)
+		if len(match) < 2 {
+			continue
+		}
+		id, err := strconv.ParseInt(match[1], 10, 64)
+		if err == nil && id > 0 {
+			return id
+		}
+	}
+	return 0
+}
+
+func extractQuestionID(query string) int64 {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return 0
+	}
+	for _, pattern := range questionIDPatterns {
+		match := pattern.FindStringSubmatch(query)
+		if len(match) < 2 {
+			continue
+		}
+		id, err := strconv.ParseInt(match[1], 10, 64)
+		if err == nil && id > 0 {
+			return id
+		}
+	}
+	if containsAny(strings.ToLower(query), "题面", "题目详情", "题目内容", "查看题目", "检索题面", "题目信息") {
+		raw := looseNumberPattern.FindString(query)
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err == nil && id > 0 {
+			return id
+		}
+	}
+	return 0
+}
+
+func submissionIDStatus(submissionID int64) string {
+	if submissionID > 0 {
+		return "known"
+	}
+	return "missing"
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveContextReferences(state workState) workState {
+	if !referencesPreviousContext(state.Query) || len(state.History) == 0 {
+		return state
+	}
+	if state.Request.QuestionID <= 0 {
+		state.Request.QuestionID = lastQuestionIDFromHistory(state.History)
+	}
+	if state.Request.SubmissionID <= 0 {
+		state.Request.SubmissionID = lastSubmissionIDFromHistory(state.History)
+	}
+	if strings.TrimSpace(state.Request.Code) == "" {
+		state.Request.Code = lastCodeFromHistory(state.History)
+	}
+	return state
+}
+
+func referencesPreviousContext(query string) bool {
+	return containsAny(strings.ToLower(query), "上面", "上边", "刚才", "之前", "上一", "前面", "这段代码", "这个代码", "上述代码")
+}
+
+func lastQuestionIDFromHistory(history []*schema.Message) int64 {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i] == nil {
+			continue
+		}
+		if id := extractQuestionID(extractDisplayContent(history[i])); id > 0 {
+			return id
+		}
+	}
+	return 0
+}
+
+func lastSubmissionIDFromHistory(history []*schema.Message) int64 {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i] == nil {
+			continue
+		}
+		if id := extractSubmissionID(extractDisplayContent(history[i])); id > 0 {
+			return id
+		}
+	}
+	return 0
+}
+
+func lastCodeFromHistory(history []*schema.Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i] == nil {
+			continue
+		}
+		if code := extractCodeBlock(extractDisplayContent(history[i])); strings.TrimSpace(code) != "" {
+			return code
+		}
+	}
+	return ""
+}
+
+var (
+	kkgCodePattern    = regexp.MustCompile(`(?is)<kkg-code\b[^>]*>\s*(.*?)\s*</kkg-code>`)
+	fencedCodePattern = regexp.MustCompile("(?is)```(?:[a-zA-Z0-9_+.#-]+)?\\s*\\n(.*?)\\n```")
+)
+
+func extractCodeBlock(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if match := kkgCodePattern.FindStringSubmatch(text); len(match) > 1 {
+		return strings.TrimSpace(match[1])
+	}
+	if match := fencedCodePattern.FindStringSubmatch(text); len(match) > 1 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
+}
+
+func rebuildRuntimeMessages(state *workState) {
+	if state == nil {
+		return
+	}
+	messages := make([]*schema.Message, 0, len(state.History)+1)
+	messages = append(messages, state.History...)
+	messages = append(messages, schema.UserMessage(agentUserPrompt(*state)))
+	state.Messages = messages
+}
+
+func replaceLastAssistantMessage(messages []*schema.Message, content string) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i] != nil && messages[i].Role == schema.Assistant {
+			messages[i].Content = content
+			return
+		}
+	}
+}
+
+func normalizeKKGCodeProtocol(answer string) string {
+	out := strings.TrimSpace(answer)
+	replacements := [][2]string{
+		{"```go\n<kkg-code", "<kkg-code"},
+		{"```golang\n<kkg-code", "<kkg-code"},
+		{"```cpp\n<kkg-code", "<kkg-code"},
+		{"```c++\n<kkg-code", "<kkg-code"},
+		{"```java\n<kkg-code", "<kkg-code"},
+		{"```python\n<kkg-code", "<kkg-code"},
+		{"```py\n<kkg-code", "<kkg-code"},
+		{"```\n<kkg-code", "<kkg-code"},
+		{"</kkg-code>\n```", "</kkg-code>"},
+	}
+	for _, replacement := range replacements {
+		out = strings.ReplaceAll(out, replacement[0], replacement[1])
+	}
+	out = strings.ReplaceAll(out, "```go<kkg-code", "<kkg-code")
+	out = strings.ReplaceAll(out, "```<kkg-code", "<kkg-code")
+	out = strings.ReplaceAll(out, "</kkg-code>```", "</kkg-code>")
+	return strings.TrimSpace(out)
 }
