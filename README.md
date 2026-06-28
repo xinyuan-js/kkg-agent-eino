@@ -109,13 +109,13 @@ flowchart TD
     C --> D[router agent]
     D --> E[question agent]
     E --> F[kkg_oj_submit_solution]
-    F -->|submit_confirmed=false| G[返回 approval required]
-    G --> H[recordADKMessage 识别授权事件]
+    F -->|StatefulInterrupt| G[ADK interrupt]
+    G --> H[executeRouterAgent 识别授权事件]
     H --> I[发送 approval_required 流事件]
     I --> J[前端展示确认卡]
     J -->|确认提交| K[新一轮请求 approval_id + approval_action]
-    K --> L[normalize 回填 question_id/code/language]
-    L --> M[question agent 再次调用提交工具]
+    K --> L[Runner ResumeWithParams]
+    L --> M[提交工具读取 interrupt state]
     M --> N[真实提交到 KKG OJ]
     N --> O[postprocess_answer]
     O --> P[persist_session]
@@ -144,6 +144,7 @@ flowchart TD
 更多细节见：
 
 - [架构说明](docs/architecture.md)
+- [后端代码结构](docs/backend-structure.md)
 - [Eino 业务流程约束](docs/eino-workflow.md)
 - [KKG 鉴权与 API 契约](docs/kkg-api-auth.md)
 - [RAG 向量库流程](docs/rag-pipeline.md)

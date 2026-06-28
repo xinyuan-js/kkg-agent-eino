@@ -23,6 +23,9 @@ export type ChatSession = {
 
 export type ToolTraceItem = {
   kind?: 'stage' | 'callback' | 'model' | 'tool' | string
+  seq?: number
+  timestamp?: string
+  elapsed_ms?: number
   name: string
   status: string
   message?: string

@@ -100,6 +100,9 @@ type ConversationSession struct {
 
 type ToolTrace struct {
 	Kind       string         `json:"kind,omitempty"`
+	Seq        int            `json:"seq,omitempty"`
+	Timestamp  string         `json:"timestamp,omitempty"`
+	ElapsedMS  int64          `json:"elapsed_ms,omitempty"`
 	Name       string         `json:"name"`
 	Status     string         `json:"status"`
 	Message    string         `json:"message,omitempty"`
@@ -135,14 +138,13 @@ type RAGSearchInput struct {
 }
 
 type Service struct {
-	retriever     rag.Retriever
-	chatModel     einomodel.BaseChatModel
-	tools         []einotool.BaseTool
-	runner        *adk.Runner
-	memory        memory.Store
-	chain         compose.Runnable[RunRequest, RunResponse]
-	graph         compose.Runnable[RunRequest, RunResponse]
-	approvalStore approvalStore
+	retriever rag.Retriever
+	chatModel einomodel.BaseChatModel
+	tools     []einotool.BaseTool
+	runner    *adk.Runner
+	memory    memory.Store
+	chain     compose.Runnable[RunRequest, RunResponse]
+	graph     compose.Runnable[RunRequest, RunResponse]
 }
 
 type workState struct {

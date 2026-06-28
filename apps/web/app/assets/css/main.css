@@ -1069,6 +1069,22 @@ textarea:focus {
   font-weight: 700;
 }
 
+.trace-row span b {
+  min-width: 0;
+  font: inherit;
+}
+
+.trace-meta {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid #dce3e1;
+  color: #64706d;
+  background: #ffffff;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
 .trace-row strong {
   justify-self: end;
   padding: 2px 6px;

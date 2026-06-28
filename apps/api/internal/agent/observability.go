@@ -14,6 +14,13 @@ import (
 
 type streamEmitterKey struct{}
 type callbackTraceRecorderKey struct{}
+type traceSequencerKey struct{}
+
+type traceSequencer struct {
+	mu      sync.Mutex
+	next    int
+	started time.Time
+}
 
 type callbackTraceRecorder struct {
 	mu     sync.Mutex
@@ -34,6 +41,10 @@ func emitStreamEvent(ctx context.Context, event StreamEvent) {
 	if ctx == nil {
 		return
 	}
+	if event.Trace != nil {
+		trace := stampTrace(ctx, *event.Trace)
+		event.Trace = &trace
+	}
 	emit, ok := ctx.Value(streamEmitterKey{}).(func(StreamEvent) error)
 	if !ok || emit == nil {
 		return
@@ -45,6 +56,7 @@ func recordCallbackTrace(ctx context.Context, trace ToolTrace) {
 	if ctx == nil {
 		return
 	}
+	trace = stampTrace(ctx, trace)
 	recorder, _ := ctx.Value(callbackTraceRecorderKey{}).(*callbackTraceRecorder)
 	if recorder != nil {
 		recorder.mu.Lock()
@@ -67,10 +79,32 @@ func callbackTracesFromContext(ctx context.Context) []ToolTrace {
 }
 
 func appendTrace(ctx context.Context, state *workState, trace ToolTrace) {
+	trace = stampTrace(ctx, trace)
 	if state != nil {
 		state.ToolTrace = append(state.ToolTrace, trace)
 	}
 	emitStreamEvent(ctx, StreamEvent{Type: "trace", Trace: &trace})
+}
+
+func stampTrace(ctx context.Context, trace ToolTrace) ToolTrace {
+	now := time.Now()
+	if strings.TrimSpace(trace.Timestamp) == "" {
+		trace.Timestamp = now.Format(time.RFC3339Nano)
+	}
+	sequencer, _ := ctx.Value(traceSequencerKey{}).(*traceSequencer)
+	if sequencer == nil {
+		return trace
+	}
+	sequencer.mu.Lock()
+	defer sequencer.mu.Unlock()
+	if trace.Seq <= 0 {
+		sequencer.next++
+		trace.Seq = sequencer.next
+	}
+	if trace.ElapsedMS <= 0 && !sequencer.started.IsZero() {
+		trace.ElapsedMS = now.Sub(sequencer.started).Milliseconds()
+	}
+	return trace
 }
 
 func collectMessageUsage(ctx context.Context, state *workState, msg *schema.Message, streamedUsage TokenUsage) {

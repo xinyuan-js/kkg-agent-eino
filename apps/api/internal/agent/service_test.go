@@ -2,61 +2,41 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
 
 	"kkg-agent-eino/apps/api/internal/kkgtools"
 )
 
-func TestNormalizeApprovalApproveHydratesSubmitRequest(t *testing.T) {
+func TestNormalizeApprovalApproveMarksSubmitIntent(t *testing.T) {
 	svc := &Service{}
-	approval := svc.approvalStore.save(storedApproval{
-		ApprovalRequest: ApprovalRequest{
-			ID:         "approval_1",
-			SessionID:  "sess_1",
-			QuestionID: 173,
-			Language:   "go",
-		},
-		UserID:    7,
-		Code:      "package main\nfunc main(){}",
-		CreatedAt: time.Now(),
-	})
-
 	got, err := svc.normalize(context.Background(), RunRequest{
 		SessionID:      "sess_1",
-		UserID:         7,
-		ApprovalID:     approval.ID,
+		ApprovalID:     "interrupt_1",
 		ApprovalAction: approvalReplyApprove,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Request.Submit || got.Request.QuestionID != 173 || strings.TrimSpace(got.Request.Code) == "" {
-		t.Fatalf("RunRequest = %+v, want hydrated submit request", got.Request)
+	if !got.Request.Submit {
+		t.Fatalf("RunRequest = %+v, want submit=true", got.Request)
+	}
+	if got.Query != "确认提交代码" {
+		t.Fatalf("Query = %q, want confirmation placeholder", got.Query)
 	}
 }
 
 func TestNormalizeApprovalRejectReturnsDirectAnswer(t *testing.T) {
 	svc := &Service{}
-	approval := svc.approvalStore.save(storedApproval{
-		ApprovalRequest: ApprovalRequest{
-			ID:         "approval_2",
-			SessionID:  "sess_2",
-			QuestionID: 173,
-			Language:   "go",
-		},
-		UserID:    8,
-		Code:      "package main\nfunc main(){}",
-		CreatedAt: time.Now(),
-	})
-
 	got, err := svc.normalize(context.Background(), RunRequest{
 		SessionID:      "sess_2",
-		UserID:         8,
-		ApprovalID:     approval.ID,
+		ApprovalID:     "interrupt_2",
 		ApprovalAction: approvalReplyReject,
 	})
 	if err != nil {
@@ -275,36 +255,95 @@ func TestClassifyRequestInheritsCodeAndQuestionFromHistory(t *testing.T) {
 	}
 }
 
-func TestApprovalFromToolPayloadCreatesApprovalRequest(t *testing.T) {
+func TestClassifyRequestInheritsImplicitSubmitContextFromHistory(t *testing.T) {
 	svc := &Service{}
 	state := workState{
 		Request: RunRequest{
-			UserID:     9,
-			QuestionID: 173,
-			Language:   "go",
-			Code:       "package main\nfunc main(){}",
+			Query:       "提交一下",
+			AccessToken: "token",
 		},
-		SessionID:    "sess_approval",
-		TurnMessages: []*schema.Message{schema.UserMessage("帮我提交代码")},
-	}
-	payload := &kkgtools.ResultPayload{
-		Tool:    "kkg_oj_submit_solution",
-		OK:      true,
-		Summary: "approval required",
-		Data: map[string]any{
-			"approval_required": true,
-			"question_id":       173,
-			"language":          "go",
-			"code_chars":        24,
-			"code_lines":        2,
+		Query: "提交一下",
+		History: []*schema.Message{
+			schema.UserMessage("题目 173 怎么写"),
+			schema.AssistantMessage("题目 173 参考代码：\n<kkg-code lang=\"go\">\npackage main\nfunc main(){}\n</kkg-code>", nil),
 		},
 	}
 
-	got := svc.approvalFromToolPayload(&state, "kkg_oj_submit_solution", payload)
-	if got == nil {
-		t.Fatal("approvalFromToolPayload() = nil, want approval payload")
+	got, err := svc.classifyRequest(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got.QuestionID != 173 || got.CodeLines != 2 {
+	if got.Request.QuestionID != 173 {
+		t.Fatalf("QuestionID = %d, want 173", got.Request.QuestionID)
+	}
+	if strings.TrimSpace(got.Request.Code) == "" {
+		t.Fatal("Request.Code is empty, want inherited code")
+	}
+	if got.ToolPolicy["submit_intent"] != true || got.ToolPolicy["requires_submit_confirmation"] != true {
+		t.Fatalf("ToolPolicy = %+v, want submit intent requiring confirmation", got.ToolPolicy)
+	}
+	if !containsString(got.IntentHints, "context_reference") {
+		t.Fatalf("IntentHints = %+v, want context_reference", got.IntentHints)
+	}
+}
+
+func TestClassifyRequestInheritsStructuredSubmissionContextFromHistory(t *testing.T) {
+	svc := &Service{}
+	state := workState{
+		Request: RunRequest{
+			Query:       "查一下是否通过",
+			AccessToken: "token",
+		},
+		Query: "查一下是否通过",
+		History: []*schema.Message{
+			schema.UserMessage(`{"user_query":"帮我提交题目 173","question_id":173,"submission_id":22,"code":"package main\nfunc main(){}"}`),
+		},
+	}
+
+	got, err := svc.classifyRequest(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Request.QuestionID != 173 {
+		t.Fatalf("QuestionID = %d, want 173", got.Request.QuestionID)
+	}
+	if got.Request.SubmissionID != 22 {
+		t.Fatalf("SubmissionID = %d, want 22", got.Request.SubmissionID)
+	}
+	if got.ToolPolicy["judge_intent"] != true || got.ToolPolicy["submit_intent"] == true {
+		t.Fatalf("ToolPolicy = %+v, want judge intent without submit intent", got.ToolPolicy)
+	}
+	if !containsString(got.IntentHints, "context_reference") {
+		t.Fatalf("IntentHints = %+v, want context_reference", got.IntentHints)
+	}
+}
+
+func TestApprovalFromInterruptEventCreatesApprovalRequest(t *testing.T) {
+	event := &adk.AgentEvent{
+		Action: &adk.AgentAction{
+			Interrupted: &adk.InterruptInfo{
+				InterruptContexts: []*adk.InterruptCtx{{
+					ID:          "interrupt_1",
+					IsRootCause: true,
+					Info: kkgtools.SubmitApprovalInfo{
+						Action:     approvalActionSubmit,
+						Title:      "确认提交代码",
+						Message:    "准备提交题目 173 的 GO 代码。确认后将正式提交到 KKG OJ。",
+						QuestionID: 173,
+						Language:   "go",
+						CodeChars:  24,
+						CodeLines:  2,
+					},
+				}},
+			},
+		},
+	}
+
+	got := approvalFromInterruptEvent(event, "sess_approval")
+	if got == nil {
+		t.Fatal("approvalFromInterruptEvent() = nil, want approval payload")
+	}
+	if got.ID != "interrupt_1" || got.QuestionID != 173 || got.CodeLines != 2 {
 		t.Fatalf("ApprovalRequest = %+v, want hydrated approval payload", got)
 	}
 }
@@ -456,6 +495,24 @@ func TestMergeToolTracesAppendsCallbacks(t *testing.T) {
 	}
 }
 
+func TestAppendTraceAddsSequenceAndTime(t *testing.T) {
+	ctx := context.WithValue(context.Background(), traceSequencerKey{}, &traceSequencer{started: time.Now()})
+	state := workState{}
+
+	appendTrace(ctx, &state, ToolTrace{Kind: "stage", Name: "stage.one", Status: "ok"})
+	appendTrace(ctx, &state, ToolTrace{Kind: "tool", Name: "kkg_oj_get_question", Status: "ok"})
+
+	if len(state.ToolTrace) != 2 {
+		t.Fatalf("len(ToolTrace) = %d, want 2", len(state.ToolTrace))
+	}
+	if state.ToolTrace[0].Seq != 1 || state.ToolTrace[1].Seq != 2 {
+		t.Fatalf("trace seq = %+v, want 1 then 2", state.ToolTrace)
+	}
+	if state.ToolTrace[0].Timestamp == "" || state.ToolTrace[1].Timestamp == "" {
+		t.Fatalf("trace timestamps = %+v, want populated timestamps", state.ToolTrace)
+	}
+}
+
 func TestShouldRecordCallbackTraceFiltersInternalGraphState(t *testing.T) {
 	if shouldRecordCallbackTrace("unknown", "workState") {
 		t.Fatal("shouldRecordCallbackTrace unknown/workState = true, want false")
@@ -465,5 +522,130 @@ func TestShouldRecordCallbackTraceFiltersInternalGraphState(t *testing.T) {
 	}
 	if got := callbackDisplayName("unknown", "model output"); got != "model" {
 		t.Fatalf("callbackDisplayName = %q, want model", got)
+	}
+}
+
+func TestQuestionAgentInputSchemaCarriesRouterPolicy(t *testing.T) {
+	js, err := questionAgentInputSchema().ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if js == nil || js.Properties == nil {
+		t.Fatal("questionAgentInputSchema JSON schema is empty")
+	}
+	if _, ok := js.Properties.Get("tool_policy"); !ok {
+		t.Fatal("questionAgentInputSchema missing tool_policy")
+	}
+	if _, ok := js.Properties.Get("intent_hints"); !ok {
+		t.Fatal("questionAgentInputSchema missing intent_hints")
+	}
+	submit, ok := js.Properties.Get("submit")
+	if !ok {
+		t.Fatal("questionAgentInputSchema missing submit")
+	}
+	if !strings.Contains(submit.Description, "触发系统确认中断") {
+		t.Fatalf("submit description = %q, want system interrupt semantics", submit.Description)
+	}
+}
+
+func TestInjectQuestionAgentRuntimeContextFillsMissingRouterArguments(t *testing.T) {
+	state := workState{
+		Query: "提交题目 173 的代码",
+		Request: RunRequest{
+			QuestionID:   173,
+			SubmissionID: 22,
+			Language:     "go",
+			Code:         "package main\nfunc main(){}",
+			Input:        "1 2\n",
+		},
+		IntentHints: []string{"explicit_question_id", "submit_or_judge_request"},
+		ToolPolicy: map[string]any{
+			"submit_intent": true,
+			"judge_intent":  false,
+		},
+	}
+	gotRaw, err := injectQuestionAgentArguments(`{"request":"帮我提交"}`, agentRuntimeContext{
+		UserQuery:    state.Query,
+		QuestionID:   state.Request.QuestionID,
+		SubmissionID: state.Request.SubmissionID,
+		Language:     state.Request.Language,
+		Code:         state.Request.Code,
+		Input:        state.Request.Input,
+		ToolPolicy:   state.ToolPolicy,
+		IntentHints:  state.IntentHints,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(gotRaw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if valueAsInt64(got["question_id"]) != 173 || valueAsInt64(got["submission_id"]) != 22 {
+		t.Fatalf("arguments = %s, want injected question/submission ids", gotRaw)
+	}
+	if strings.TrimSpace(fmt.Sprint(got["code"])) == "" || got["submit"] != true {
+		t.Fatalf("arguments = %s, want injected code and forced submit", gotRaw)
+	}
+	if request := strings.TrimSpace(fmt.Sprint(got["request"])); !strings.Contains(request, "用户请求：帮我提交") || !strings.Contains(request, "question_id=173") {
+		t.Fatalf("request = %q, want self-contained task context", request)
+	}
+	if _, ok := got["tool_policy"]; !ok {
+		t.Fatalf("arguments = %s, want injected tool_policy", gotRaw)
+	}
+}
+
+func TestInjectQuestionAgentRuntimeContextBuildsRequestForEmptyRouterArguments(t *testing.T) {
+	gotRaw, err := injectQuestionAgentArguments(`{}`, agentRuntimeContext{
+		UserQuery:  "提交一下",
+		QuestionID: 173,
+		Language:   "go",
+		Code:       "package main\nfunc main(){}",
+		ToolPolicy: map[string]any{
+			"logged_in":                    true,
+			"submit_intent":                true,
+			"requires_submit_confirmation": true,
+			"code_status":                  "provided",
+			"question_id_status":           "known",
+		},
+		IntentHints: []string{"context_reference", "submit_or_judge_request"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(gotRaw), &got); err != nil {
+		t.Fatal(err)
+	}
+	request := strings.TrimSpace(fmt.Sprint(got["request"]))
+	if request == "" || !strings.Contains(request, "用户请求：提交一下") || !strings.Contains(request, "code 字段已提供") {
+		t.Fatalf("request = %q, want self-contained non-empty request", request)
+	}
+	if valueAsInt64(got["question_id"]) != 173 || strings.TrimSpace(fmt.Sprint(got["code"])) == "" || got["submit"] != true {
+		t.Fatalf("arguments = %s, want injected question id, code and submit", gotRaw)
+	}
+}
+
+func TestInjectQuestionAgentRuntimeContextDoesNotForceSubmitForJudgeQuery(t *testing.T) {
+	state := workState{
+		Query: "查询提交结果",
+		ToolPolicy: map[string]any{
+			"submit_intent": true,
+			"judge_intent":  true,
+		},
+	}
+	gotRaw, err := injectQuestionAgentArguments(`{}`, agentRuntimeContext{
+		UserQuery:  state.Query,
+		ToolPolicy: state.ToolPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(gotRaw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["submit"] == true {
+		t.Fatalf("arguments = %s, judge query should not force submit", gotRaw)
 	}
 }

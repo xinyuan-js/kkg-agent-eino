@@ -89,6 +89,9 @@ function isVisibleTrace(item: ToolTraceItem) {
 }
 
 const visibleTraceItems = computed(() => traceItems.value.filter(isVisibleTrace))
+const orderedTraceItems = computed(() => {
+  return [...visibleTraceItems.value].sort((a, b) => traceOrder(a) - traceOrder(b))
+})
 const toolTraceCount = computed(() => visibleTraceItems.value.filter((item) => traceKind(item) === 'tool').length)
 const callbackTraceCount = computed(() => visibleTraceItems.value.filter((item) => traceKind(item) === 'callback').length)
 const traceGroups = computed(() => {
@@ -99,7 +102,7 @@ const traceGroups = computed(() => {
     { key: 'callback', title: '底层回调', items: [] as ToolTraceItem[] },
   ]
   const byKind = new Map(groups.map((group) => [group.key, group]))
-  for (const item of visibleTraceItems.value) {
+  for (const item of orderedTraceItems.value) {
     const kind = traceKind(item)
     const group = byKind.get(kind) || byKind.get('stage')
     group?.items.push(item)
@@ -139,6 +142,35 @@ function traceTitle(item: ToolTraceItem) {
     kkg_platform_agent: '平台说明智能体',
   }
   return labels[name] || name
+}
+
+function traceOrder(item: ToolTraceItem) {
+  if (typeof item.seq === 'number' && Number.isFinite(item.seq) && item.seq > 0) {
+    return item.seq
+  }
+  if (item.timestamp) {
+    const time = Date.parse(item.timestamp)
+    if (Number.isFinite(time)) {
+      return time
+    }
+  }
+  return Number.MAX_SAFE_INTEGER
+}
+
+function traceMeta(item: ToolTraceItem) {
+  const parts: string[] = []
+  if (typeof item.seq === 'number' && Number.isFinite(item.seq) && item.seq > 0) {
+    parts.push(`#${item.seq}`)
+  }
+  if (typeof item.elapsed_ms === 'number' && Number.isFinite(item.elapsed_ms)) {
+    parts.push(`+${item.elapsed_ms} ms`)
+  } else if (item.timestamp) {
+    const date = new Date(item.timestamp)
+    if (!Number.isNaN(date.getTime())) {
+      parts.push(date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }))
+    }
+  }
+  return parts.join(' ')
 }
 
 function traceDetail(item: ToolTraceItem) {
@@ -734,7 +766,10 @@ onMounted(async () => {
                     <small>{{ group.items.length }}</small>
                   </header>
                   <div v-for="(item, index) in group.items" :key="group.key + item.name + item.status + index" class="trace-row">
-                    <span>{{ traceTitle(item) }}</span>
+                    <span>
+                      <em v-if="traceMeta(item)" class="trace-meta">{{ traceMeta(item) }}</em>
+                      <b>{{ traceTitle(item) }}</b>
+                    </span>
                     <strong :class="item.status">{{ traceStatus(item) }}</strong>
                     <small v-if="traceDetail(item)">{{ traceDetail(item) }}</small>
                   </div>

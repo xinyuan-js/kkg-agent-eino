@@ -12,69 +12,6 @@ import (
 	"kkg-agent-eino/apps/api/internal/kkg"
 )
 
-type SearchPostsInput struct {
-	Query string `json:"query" jsonschema:"required" jsonschema_description:"搜索关键词"`
-	Limit int    `json:"limit,omitempty" jsonschema_description:"最大返回数量，默认 5，最大 50"`
-}
-
-type GetPostInput struct {
-	ID int64 `json:"id" jsonschema:"required" jsonschema_description:"博客文章 ID"`
-}
-
-type ListPostsInput struct {
-	Limit int `json:"limit,omitempty" jsonschema_description:"最大返回数量，默认 20，最大 50"`
-}
-
-type GetPostCommentsInput struct {
-	PostID int64 `json:"post_id" jsonschema:"required" jsonschema_description:"博客文章 ID"`
-	Limit  int   `json:"limit,omitempty" jsonschema_description:"最大返回数量，默认 20，最大 200"`
-}
-
-type ListQuestionsInput struct {
-	Current   int64  `json:"current,omitempty" jsonschema_description:"页码，默认 1"`
-	PageSize  int64  `json:"page_size,omitempty" jsonschema_description:"每页数量，默认 5，最大 50"`
-	SortField string `json:"sort_field,omitempty" jsonschema_description:"排序字段"`
-	SortOrder string `json:"sort_order,omitempty" jsonschema_description:"排序方向"`
-}
-
-type GetQuestionInput struct {
-	ID int64 `json:"id" jsonschema:"required" jsonschema_description:"OJ 题目 ID"`
-}
-
-type RunCodeInput struct {
-	Language   string `json:"language,omitempty" jsonschema_description:"代码语言，目前 KKG OJ 仅支持 go，默认 go"`
-	Code       string `json:"code" jsonschema:"required" jsonschema_description:"待运行代码"`
-	QuestionID int64  `json:"question_id" jsonschema:"required" jsonschema_description:"OJ 题目 ID"`
-	Input      string `json:"input,omitempty" jsonschema_description:"自定义标准输入"`
-}
-
-type SubmitSolutionInput struct {
-	Language   string `json:"language,omitempty" jsonschema_description:"代码语言，目前 KKG OJ 仅支持 go，默认 go"`
-	Code       string `json:"code" jsonschema:"required" jsonschema_description:"待提交代码"`
-	QuestionID int64  `json:"question_id" jsonschema:"required" jsonschema_description:"OJ 题目 ID"`
-}
-
-type ListSubmissionsInput struct {
-	Current    int64 `json:"current,omitempty" jsonschema_description:"页码，默认 1"`
-	PageSize   int64 `json:"page_size,omitempty" jsonschema_description:"每页数量，默认 5，最大 20"`
-	QuestionID int64 `json:"question_id,omitempty" jsonschema_description:"OJ 题目 ID"`
-	UserID     int64 `json:"user_id,omitempty" jsonschema_description:"用户 ID，普通用户只能查询自己"`
-	Status     int32 `json:"status,omitempty" jsonschema_description:"提交状态：0 pending，1 running，2 accepted，通过，3 rejected，未通过，4 system_error"`
-}
-
-type GetSubmissionResultInput struct {
-	SubmissionID int64 `json:"submission_id,omitempty" jsonschema_description:"可选，提交记录 ID；按提交 ID 查询时只传 submission_id 即可，不需要 question_id"`
-	QuestionID   int64 `json:"question_id,omitempty" jsonschema_description:"可选，仅在 submission_id 为空时用于查询该题最新提交；不是按 submission_id 查询的必填项"`
-	UserID       int64 `json:"user_id,omitempty" jsonschema_description:"可选，普通用户通常留空或仅查询自己"`
-	MaxPages     int64 `json:"max_pages,omitempty" jsonschema_description:"扫描提交列表的最大页数，默认 5，最大 20。返回 status_label 和 passed 判断是否通过"`
-}
-
-type ListQuestionSolutionsInput struct {
-	Current    int64 `json:"current,omitempty" jsonschema_description:"页码，默认 1"`
-	PageSize   int64 `json:"page_size,omitempty" jsonschema_description:"每页数量，默认 5，最大 50"`
-	QuestionID int64 `json:"question_id" jsonschema:"required" jsonschema_description:"OJ 题目 ID"`
-}
-
 func New(client *kkg.Client) ([]einotool.BaseTool, error) {
 	if client == nil {
 		return nil, fmt.Errorf("kkg client is required")
@@ -211,37 +148,71 @@ func newRunCodeTool(client *kkg.Client) (einotool.BaseTool, error) {
 
 func newSubmitSolutionTool(client *kkg.Client) (einotool.BaseTool, error) {
 	return utils.InferEnhancedTool("kkg_oj_submit_solution", "正式提交代码到 KKG OJ 判题。调用前必须已经获得用户明确确认，例如用户回复“确认提交”。需要登录态，目前仅支持 Go，且受提交频率限制。", func(ctx context.Context, input SubmitSolutionInput) (*schema.ToolResult, error) {
-		if !submitConfirmedFromContext(ctx) {
-			language := input.Language
-			if language == "" {
-				language = "go"
-			}
-			return newToolResult(ResultPayload{
-				Tool:    "kkg_oj_submit_solution",
-				OK:      true,
-				Summary: "approval required",
-				Data: map[string]any{
-					"approval_required": true,
-					"question_id":       input.QuestionID,
-					"language":          language,
-					"code_chars":        len([]rune(strings.TrimSpace(input.Code))),
-					"code_lines":        countLines(input.Code),
-				},
-			})
+		language := input.Language
+		if language == "" {
+			language = "go"
 		}
-		return executeTool(ctx, "kkg_oj_submit_solution", func(ctx context.Context) (any, error) {
+		wasInterrupted, hasState, savedState := einotool.GetInterruptState[SubmitApprovalState](ctx)
+		if !wasInterrupted {
 			if input.QuestionID <= 0 {
 				return nil, fmt.Errorf("question_id is required")
 			}
 			if strings.TrimSpace(input.Code) == "" {
 				return nil, fmt.Errorf("code is required")
 			}
-			language := input.Language
-			if language == "" {
-				language = "go"
+			state := SubmitApprovalState{
+				QuestionID: input.QuestionID,
+				Language:   language,
+				Code:       input.Code,
+			}
+			info := SubmitApprovalInfo{
+				Action:     "submit_solution",
+				Title:      "确认提交代码",
+				Message:    fmt.Sprintf("准备提交题目 %d 的 %s 代码。确认后将正式提交到 KKG OJ。", input.QuestionID, strings.ToUpper(language)),
+				QuestionID: input.QuestionID,
+				Language:   language,
+				CodeChars:  len([]rune(strings.TrimSpace(input.Code))),
+				CodeLines:  countLines(input.Code),
+			}
+			return nil, einotool.StatefulInterrupt(ctx, info, state)
+		}
+		if !hasState {
+			return nil, fmt.Errorf("submit approval state is missing")
+		}
+		isResumeTarget, hasData, decision := einotool.GetResumeContext[SubmitApprovalDecision](ctx)
+		if !isResumeTarget {
+			info := SubmitApprovalInfo{
+				Action:     "submit_solution",
+				Title:      "确认提交代码",
+				Message:    fmt.Sprintf("准备提交题目 %d 的 %s 代码。确认后将正式提交到 KKG OJ。", savedState.QuestionID, strings.ToUpper(savedState.Language)),
+				QuestionID: savedState.QuestionID,
+				Language:   savedState.Language,
+				CodeChars:  len([]rune(strings.TrimSpace(savedState.Code))),
+				CodeLines:  countLines(savedState.Code),
+			}
+			return nil, einotool.StatefulInterrupt(ctx, info, savedState)
+		}
+		if !hasData || !decision.Approved {
+			return newToolResult(ResultPayload{
+				Tool:    "kkg_oj_submit_solution",
+				OK:      true,
+				Summary: "submission canceled",
+				Data: map[string]any{
+					"approved":    false,
+					"question_id": savedState.QuestionID,
+					"language":    savedState.Language,
+				},
+			})
+		}
+		return executeTool(ctx, "kkg_oj_submit_solution", func(ctx context.Context) (any, error) {
+			if savedState.QuestionID <= 0 {
+				return nil, fmt.Errorf("question_id is required")
+			}
+			if strings.TrimSpace(savedState.Code) == "" {
+				return nil, fmt.Errorf("code is required")
 			}
 			return client.SubmitSolution(ctx, toolContext(ctx), kkg.CodeSubmitRequest{
-				Language: language, Code: input.Code, QuestionID: input.QuestionID,
+				Language: savedState.Language, Code: savedState.Code, QuestionID: savedState.QuestionID,
 			})
 		}, func(out any) string {
 			return submitSummary(out)
@@ -287,95 +258,4 @@ func newListQuestionSolutionsTool(client *kkg.Client) (einotool.BaseTool, error)
 			})
 		}, summarizePageResult)
 	})
-}
-
-func clampInt(value, fallback, maxValue int) int {
-	if value <= 0 {
-		value = fallback
-	}
-	if value > maxValue {
-		return maxValue
-	}
-	return value
-}
-
-func clampInt64(value, fallback, maxValue int64) int64 {
-	if value <= 0 {
-		value = fallback
-	}
-	if value > maxValue {
-		return maxValue
-	}
-	return value
-}
-
-func clampInt64Min(value, minValue int64) int64 {
-	if value < minValue {
-		return minValue
-	}
-	return value
-}
-
-func submitSummary(out any) string {
-	record, ok := out.(map[string]any)
-	if !ok {
-		return "submitted"
-	}
-	id := compactToolValue(record["submission_id"])
-	if id == "" {
-		id = compactToolValue(record["id"])
-	}
-	status := compactToolValue(record["status_label"])
-	if id == "" && status == "" {
-		return "submitted"
-	}
-	if id == "" {
-		return "submitted " + status
-	}
-	if status == "" {
-		return "submission " + id
-	}
-	return "submission " + id + " " + status
-}
-
-func submissionResultSummary(submissionID int64) func(map[string]any) string {
-	return func(out map[string]any) string {
-		id := ""
-		if submissionID > 0 {
-			id = fmt.Sprintf("%d", submissionID)
-		}
-		if out != nil {
-			if value := compactToolValue(out["id"]); value != "" {
-				id = value
-			}
-			if value := compactToolValue(out["submission_id"]); value != "" {
-				id = value
-			}
-			if status := compactToolValue(out["status_label"]); status != "" {
-				if id == "" {
-					return "latest submission " + status
-				}
-				return "submission " + id + " " + status
-			}
-		}
-		if id == "" {
-			return "latest submission"
-		}
-		return "submission " + id
-	}
-}
-
-func compactToolValue(value any) string {
-	if value == nil {
-		return ""
-	}
-	return strings.TrimSpace(fmt.Sprint(value))
-}
-
-func countLines(code string) int {
-	code = strings.TrimSpace(code)
-	if code == "" {
-		return 0
-	}
-	return strings.Count(code, "\n") + 1
 }
